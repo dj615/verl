@@ -10,8 +10,6 @@ from typing import Optional, Dict, List
 import wandb
 import shutil
 
-from transformers import AutoConfig  # 预留，方便你以后扩展
-
 from .metrics import (
     compute_ce_loss_on_parquet_or_jsonl,
 )
@@ -218,7 +216,7 @@ def build_sft_cmd(args, ckpt_in: str, ckpt_out: Path) -> str:
         f"optim.lr={args.sft_learning_rate}",
         f"optim.lr_scheduler={args.sft_lr_schedule}",
         "trainer.logger=[console,wandb]",
-        "trainer.project_name=ASR_SFT",
+        "trainer.project_name=Two_SFT",
         f"trainer.experiment_name={args.sft_experiment_name}",
         f"trainer.default_local_dir={str(ckpt_out)}",
         f"trainer.total_epochs={args.sft_epochs}",
@@ -282,7 +280,7 @@ def build_rl_cmd(args, ckpt_in: str, ckpt_out: Path) -> str:
         f"trainer.total_epochs={args.rl_epochs}",
         "trainer.resume_mode=disable",
         "trainer.logger=[console,wandb]",
-        f"trainer.project_name=ASR_RL",
+        f"trainer.project_name=Two_RL",
         f"trainer.experiment_name={args.rl_experiment_name}",
         f"trainer.default_local_dir={str(ckpt_out)}",
         f"trainer.n_gpus_per_node={args.rl_trainer_n_gpus_per_node}",
@@ -300,44 +298,46 @@ def main():
     # ===== 基础参数 =====
     parser.add_argument("--base_model_or_ckpt", type=str, required=True)
     parser.add_argument("--tokenizer", type=str, default=None)
-    parser.add_argument("--work_dir", type=str, required=True)
-    parser.add_argument("--sft_ckpt_dir", type=str, default="ckpts_sft")
-    parser.add_argument("--rl_ckpt_dir", type=str, default="ckpts_rl")
+    parser.add_argument("--work_dir", type=str, default="/root/workspace/checkpoints")
+    parser.add_argument("--sft_ckpt_dir", type=str, default=None)
+    parser.add_argument("--rl_ckpt_dir", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--device", type=str, default="cuda")
 
     # ===== 数据集 =====
-    parser.add_argument("--d1_train", type=str, required=True)
-    parser.add_argument("--d1_val", type=str, required=True)
-    parser.add_argument("--d2_train", type=str, required=True)
-    parser.add_argument("--d2_val", type=str, required=True)
+    parser.add_argument("--sft_task", type=str, choices=["DAPO_MATH", "gsm8k", "HARP", "MATH", "NuminaMath_1.5", "NuminaMath_CoT", "OpenR1_Math_220k", "openscience"], required=True)
+    parser.add_argument("--rl_task", type=str, choices=["DAPO_MATH", "gsm8k", "HARP", "MATH", "NuminaMath_1.5", "NuminaMath_CoT", "OpenR1_Math_220k", "openscience"], required=True)
+    parser.add_argument("--d1_train", type=str, default=None)
+    parser.add_argument("--d1_val", type=str, default=None)
+    parser.add_argument("--d2_train", type=str, default=None)
+    parser.add_argument("--d2_val", type=str, default=None)
     parser.add_argument("--prompt_key_d1", type=str, default="question")
     parser.add_argument("--response_key_d1", type=str, default="answer")
     parser.add_argument("--prompt_key_d2", type=str, default="question")
     parser.add_argument("--response_key_d2", type=str, default="answer")
 
     # ===== SFT 配置 =====
-    parser.add_argument("--sft_max_length", type=int, default=4096)
+    parser.add_argument("--sft_max_length", type=int, default=40960)
     parser.add_argument("--sft_truncation", type=str, default="right", choices=["error", "left", "right", "middle"])
     parser.add_argument("--sft_lora_enable", type=int, default=1)
     parser.add_argument("--sft_lora_rank", type=int, default=8)
     parser.add_argument("--sft_lora_alpha", type=int, default=16)
-    parser.add_argument("--sft_batch_size", type=int, default=64)
+    parser.add_argument("--sft_batch_size", type=int, default=32)
     parser.add_argument("--sft_micro_batch_size_per_gpu", type=int, default=1)
-    parser.add_argument("--sft_learning_rate", type=float, default=5e-5)
+    parser.add_argument("--sft_learning_rate", type=float, default=5e-6)
     parser.add_argument("--sft_lr_schedule", type=str, default="constant")
-    parser.add_argument("--sft_epochs", type=int, default=3)
+    parser.add_argument("--sft_epochs", type=int, default=10)
     parser.add_argument("--sft_experiment_name", type=str, default="sft_then_rl_sft")
 
     # 多机多卡
-    parser.add_argument("--sft_nproc_per_node", type=int, default=1)
-    parser.add_argument("--sft_nnodes", type=int, default=1)
+    parser.add_argument("--sft_nproc_per_node", type=int, default=8)
+    parser.add_argument("--sft_nnodes", type=int, default=4)
     parser.add_argument("--sft_node_rank", type=int, default=0)
-    parser.add_argument("--sft_master_addr", type=str, default="127.0.0.1")
+    parser.add_argument("--sft_master_addr", type=str, default=None)
     parser.add_argument("--sft_master_port", type=str, default="29500")
 
     # ===== RL 配置（main_ppo）=====
-    parser.add_argument("--rl_rollout_gpu_memory_utilization", type=float, default=0.2)
+    parser.add_argument("--rl_rollout_gpu_memory_utilization", type=float, default=0.5)
     parser.add_argument("--rl_train_max_samples", type=int, default=-1)
     parser.add_argument("--rl_val_max_samples", type=int, default=-1)
     parser.add_argument("--rl_filter_overlong_prompts", action="store_true", default=True)
@@ -349,20 +349,20 @@ def main():
     parser.add_argument("--rl_lora_rank", type=int, default=8)
     parser.add_argument("--rl_lora_alpha", type=int, default=16)
 
-    parser.add_argument("--rl_batch_size", type=int, default=64)
-    parser.add_argument("--ppo_mini_batch_size", type=int, default=2)
-    parser.add_argument("--rl_micro_batch_size_per_gpu", type=int, default=1)
-    parser.add_argument("--ref_log_prob_micro_batch_size_per_gpu", type=int, default=1)
-    parser.add_argument("--rollout_log_prob_micro_batch_size_per_gpu", type=int, default=1)
-    parser.add_argument("--rl_learning_rate", type=float, default=5e-5)
+    parser.add_argument("--rl_batch_size", type=int, default=128)
+    parser.add_argument("--ppo_mini_batch_size", type=int, default=32)
+    parser.add_argument("--rl_micro_batch_size_per_gpu", type=int, default=2)
+    parser.add_argument("--ref_log_prob_micro_batch_size_per_gpu", type=int, default=2)
+    parser.add_argument("--rollout_log_prob_micro_batch_size_per_gpu", type=int, default=2)
+    parser.add_argument("--rl_learning_rate", type=float, default=5e-6)
     parser.add_argument("--rl_lr_schedule", type=str, default="constant")
-    parser.add_argument("--rl_epochs", type=int, default=1)
-    parser.add_argument("--rl_max_prompt_length", type=int, default=512)
-    parser.add_argument("--rl_max_response_length", type=int, default=512)
+    parser.add_argument("--rl_epochs", type=int, default=10)
+    parser.add_argument("--rl_max_prompt_length", type=int, default=40960)
+    parser.add_argument("--rl_max_response_length", type=int, default=8192)
 
     parser.add_argument("--rl_adv_estimator", type=str, default="grpo")
     parser.add_argument("--rl_use_kl_loss", type=int, default=1)
-    parser.add_argument("--rl_kl_coef", type=float, default=0.02)
+    parser.add_argument("--rl_kl_coef", type=float, default=0.001)
 
     parser.add_argument("--rl_rollout_n", type=int, default=8)
     parser.add_argument("--rl_rollout_temperature", type=float, default=1.0)
@@ -373,22 +373,33 @@ def main():
     parser.add_argument("--rl_reward_fn_name", type=str, default="compute_score")
 
     parser.add_argument("--rl_rollout_tensor_model_parallel_size", type=int, default=1)
-    parser.add_argument("--rl_trainer_nnodes", type=int, default=1)
-    parser.add_argument("--rl_trainer_n_gpus_per_node", type=int, default=1)
+    parser.add_argument("--rl_trainer_nnodes", type=int, default=4)
+    parser.add_argument("--rl_trainer_n_gpus_per_node", type=int, default=8)
     parser.add_argument("--rl_experiment_name", type=str, default="sft_then_rl_rl")
 
     # ===== 指标计算 =====
     parser.add_argument("--max_eval_samples", type=int, default=2048)
     parser.add_argument("--eval_batch_size", type=int, default=4)
-    parser.add_argument("--max_length", type=int, default=4096)
+    parser.add_argument("--max_length", type=int, default=40960)
     parser.add_argument("--truncate_mode", type=str, default="truncate", choices=["truncate", "skip"])
 
     # ===== wandb =====
-    parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument("--wandb_project", type=str, default="Two")
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
 
     args = parser.parse_args()
+
+    if args.sft_ckpt_dir is None or args.rl_ckpt_dir is None:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.sft_ckpt_dir = f"Two_sft_{args.task}_{timestamp}"
+        args.rl_ckpt_dir = f"Two_rl_{args.task}_{timestamp}"
+    
+    args.d1_train = f"/root/workspace/ASR_data/train/{args.sft_task}.jsonl"
+    args.d1_valid = f"/root/workspace/ASR_data/valid/{args.sft_task}.jsonl"
+    args.d2_train = f"/root/workspace/ASR_data/train/{args.rl_task}.jsonl"
+    args.d2_valid = f"/root/workspace/ASR_data/valid/{args.rl_task}.jsonl"
 
     # ===== 准备工作目录 =====
     work = Path(args.work_dir)

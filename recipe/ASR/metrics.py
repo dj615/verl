@@ -9,11 +9,23 @@ import re
 from typing import Optional
 from datasets import load_dataset
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 import os
 from typing import Tuple
+
+def _get_dist_info():
+    if not dist.is_available() or not dist.is_initialized():
+        return 1, 0, 0  # world_size, rank, local_rank
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    # LOCAL_RANK 通常由 torchrun 注入
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    return world_size, rank, local_rank
+
 
 def _resolve_model_and_tokenizer_paths(model_or_ckpt: str, tokenizer_id: Optional[str] = None):
     # 如果用户显式指定 tokenizer，就用用户的
@@ -107,8 +119,7 @@ def _prepare_ds(
 
     return ds
 
-
-def _dataloader(ds, batch_size: int, tokenizer):
+def _dataloader(ds, batch_size: int, tokenizer, sampler=None):
     def _collate(batch):
         maxlen = max(len(x["input_ids"]) for x in batch)
         pad_id = tokenizer.pad_token_id or 0
@@ -134,7 +145,13 @@ def _dataloader(ds, batch_size: int, tokenizer):
             "labels": labels,
         }
 
-    return DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=_collate)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(sampler is None),
+        sampler=sampler,
+        collate_fn=_collate,
+    )
 
 
 # ====== RL 用的奖励函数工具 ======
@@ -389,22 +406,28 @@ def compute_policy_entropy_on_parquet_or_jsonl(
     max_length: int = 4096,
     truncate_mode: str = "truncate",
 ) -> float:
+    import torch.distributed as dist
+
+    # ===== 1. 分布式信息 =====
+    world_size, rank, local_rank = _get_dist_info()
+
+    # 如果已经初始化了分布式，就让每个进程用自己的 local_rank 这块卡
+    if world_size > 1:
+        device = f"cuda:{local_rank}"
+
     model_path, tok_path = _resolve_model_and_tokenizer_paths(model_or_ckpt, tokenizer_id)
 
-    tok = AutoTokenizer.from_pretrained(
-        tok_path,
-        use_fast=True,
-    )
+    tok = AutoTokenizer.from_pretrained(tok_path, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=_to_dtype(dtype),
-    )
-    model.to(device)
+    ).to(device)
     model.eval()
 
+    # ===== 2. 读完整数据集，然后按 world_size 分 shard =====
     ds = _prepare_ds(
         file_path,
         prompt_key,
@@ -414,11 +437,15 @@ def compute_policy_entropy_on_parquet_or_jsonl(
         max_length=max_length,
         truncate_mode=truncate_mode,
     )
+
+    # 关键：每个 rank 只处理自己的 1/world_size 块
+    if world_size > 1:
+        ds = ds.shard(num_shards=world_size, index=rank)
+
     loader = _dataloader(ds, batch_size, tok)
 
-    import torch.nn.functional as F  # noqa: F401  # 保持原样，虽然这里未直接使用
-    total_ent = 0.0
-    total_tok = 0
+    total_ent = torch.tensor(0.0, device=device)
+    total_tok = torch.tensor(0.0, device=device)
 
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
@@ -430,20 +457,23 @@ def compute_policy_entropy_on_parquet_or_jsonl(
             attention_mask=attn,
             use_cache=False,
         )
-        # 对齐到下一 token：labels 是下一 token 的“真值”
         logits = outputs.logits  # [B, T, V]
 
-        # 仅在 labels != -100 的位置计算熵
         valid_mask = (labels != -100).float()  # [B, T]
-        # 分布 p = softmax(logits)
         probs = torch.softmax(logits, dim=-1)
-        # token 熵：-sum p log p
         ent = -(probs * torch.clamp(probs.log(), min=-1e9)).sum(dim=-1)  # [B, T]
         ent = ent * valid_mask
-        total_ent += ent.sum().item()
-        total_tok += valid_mask.sum().item()
 
-    return total_ent / max(total_tok, 1)
+        total_ent += ent.sum()
+        total_tok += valid_mask.sum()
+
+    # ===== 3. 汇总所有进程的统计量 =====
+    if world_size > 1:
+        dist.all_reduce(total_ent, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tok, op=dist.ReduceOp.SUM)
+
+    # 所有 rank 算出来都是同一个标量，这里随便在哪个 rank 返回都行
+    return (total_ent / torch.clamp(total_tok, min=1)).item()
 
 
 @torch.no_grad()
@@ -472,10 +502,10 @@ def compute_ce_loss_on_parquet_or_jsonl(
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=_to_dtype(dtype),
-    )
-    model.to(device)
+    ).to(device)
     model.eval()
 
+    # ===== 准备数据集 =====
     ds = _prepare_ds(
         file_path,
         prompt_key,
@@ -485,11 +515,25 @@ def compute_ce_loss_on_parquet_or_jsonl(
         max_length=max_length,
         truncate_mode=truncate_mode,
     )
-    loader = _dataloader(ds, batch_size, tok)
 
-    import torch.nn.functional as F  # noqa: F401
-    total_nll = 0.0
-    total_tok = 0
+    # ===== DDP: 每个 rank 只跑自己那一份 =====
+    if dist.is_initialized():
+        sampler = DistributedSampler(
+            ds,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            shuffle=False,
+        )
+    else:
+        sampler = None
+
+    from torch.nn import functional as F  # noqa: F401
+
+    loader = _dataloader(ds, batch_size, tok, sampler=sampler)
+
+    # 本 rank 的局部统计量
+    local_nll = torch.tensor(0.0, device=device)
+    local_tok = torch.tensor(0.0, device=device)
 
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
@@ -502,7 +546,7 @@ def compute_ce_loss_on_parquet_or_jsonl(
             use_cache=False,
         )
         logits = outputs.logits  # [B, T, V]
-        # 交叉熵只在 labels!=-100 的 token 上计算
+
         flat_labels = labels.view(-1)
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
@@ -510,11 +554,20 @@ def compute_ce_loss_on_parquet_or_jsonl(
             ignore_index=-100,
             reduction="none",
         ).view_as(labels)
-        mask = (labels != -100).float()
-        total_nll += (loss * mask).sum().item()
-        total_tok += mask.sum().item()
 
-    return total_nll / max(total_tok, 1)
+        mask = (labels != -100).float()
+        local_nll += (loss * mask).sum()
+        local_tok += mask.sum()
+
+    # ===== 所有 rank 做 all_reduce 求和 =====
+    if dist.is_initialized():
+        dist.all_reduce(local_nll, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_tok, op=dist.ReduceOp.SUM)
+
+    total_nll = local_nll.item()
+    total_tok = local_tok.item()
+
+    return total_nll / max(total_tok, 1.0)
 
 
 # ========== RL 自定义奖励函数：1 正确 / 0 错误 ==========
@@ -610,22 +663,15 @@ def compute_accuracy_on_parquet_or_jsonl(
     max_new_tokens: int = 512,
     data_source_key: Optional[str] = None,
 ) -> float:
-    """
-    在 D2 验证集上做“生成 + compute_score”来估计 accuracy：
-      - prompt 来自 `prompt_key`（默认 question）
-      - ground_truth 直接把整行样本 dict 丢给 compute_score，里面有 groundtruth/answer 等字段
-      - data_source_key / 'dataset' 字段（如果有）会传给 compute_score 用来区分 MATH / SciQ 等
+    import torch.distributed as dist
 
-    返回值：平均 accuracy \in [0,1]
-    """
-    from datasets import load_dataset
+    world_size, rank, local_rank = _get_dist_info()
+    if world_size > 1:
+        device = f"cuda:{local_rank}"
 
     model_path, tok_path = _resolve_model_and_tokenizer_paths(model_or_ckpt, tokenizer_id)
 
-    tok = AutoTokenizer.from_pretrained(
-        tok_path,
-        use_fast=True,
-    )
+    tok = AutoTokenizer.from_pretrained(tok_path, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
@@ -633,12 +679,11 @@ def compute_accuracy_on_parquet_or_jsonl(
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=_to_dtype(dtype),
-    )
-    model.to(device)
+    ).to(device)
     model.eval()
 
     ext = file_path.split(".")[-1].lower()
-    if ext in ["parquet"]:
+    if ext == "parquet":
         ds = load_dataset("parquet", data_files=file_path, split="train")
     elif ext in ["jsonl", "json"]:
         ds = load_dataset("json", data_files=file_path, split="train")
@@ -648,57 +693,130 @@ def compute_accuracy_on_parquet_or_jsonl(
     if max_samples and len(ds) > max_samples:
         ds = ds.select(range(max_samples))
 
-    total = len(ds)
-    if total == 0:
-        return 0.0
+    # 分 shard，只处理自己的那一块
+    if world_size > 1:
+        ds = ds.shard(num_shards=world_size, index=rank)
 
-    total_correct = 0
+    local_total = len(ds)
+    if local_total == 0:
+        local_correct = 0
+    else:
+        local_correct = 0
+        for start in range(0, local_total, batch_size):
+            end = min(start + batch_size, local_total)
+            batch = [ds[i] for i in range(start, end)]
+            prompts = [ex[prompt_key] for ex in batch]
 
-    # 简单按 batch 做 greedy decoding
-    for start in range(0, total, batch_size):
-        end = min(start + batch_size, total)
-        batch = [ds[i] for i in range(start, end)]
-        prompts = [ex[prompt_key] for ex in batch]
-
-        inputs = tok(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_prompt_length,
-        )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,  # greedy decoding
-            pad_token_id=tok.pad_token_id,
-            eos_token_id=tok.eos_token_id,
-        )
-
-        # 去掉 prompt 部分，只保留新生成的 tokens
-        gen_ids = outputs[:, inputs["input_ids"].shape[1]:]
-        texts = tok.batch_decode(gen_ids, skip_special_tokens=True)
-
-        from math import isfinite  # 只是保证 score 是正常数值时才计数
-
-        for ex, pred in zip(batch, texts):
-            if data_source_key and data_source_key in ex:
-                dataset_name = ex[data_source_key]
-            elif "dataset" in ex:
-                dataset_name = ex["dataset"]
-            else:
-                dataset_name = None
-
-            score = compute_score(
-                data_source=dataset_name,
-                solution_str=pred,
-                ground_truth=ex,
-                dataset=dataset_name,
+            inputs = tok(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_prompt_length,
             )
-            # compute_score 本来就是 1 正确 / 0 错误，这里只做一个稳健判断
-            if isinstance(score, (int, float)) and isfinite(score) and score >= 0.5:
-                total_correct += 1
+            inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    return float(total_correct) / float(total)
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tok.pad_token_id,
+                eos_token_id=tok.eos_token_id,
+            )
+
+            gen_ids = outputs[:, inputs["input_ids"].shape[1]:]
+            texts = tok.batch_decode(gen_ids, skip_special_tokens=True)
+
+            from math import isfinite
+
+            for ex, pred in zip(batch, texts):
+                if data_source_key and data_source_key in ex:
+                    dataset_name = ex[data_source_key]
+                elif "dataset" in ex:
+                    dataset_name = ex["dataset"]
+                else:
+                    dataset_name = None
+
+                score = compute_score(
+                    data_source=dataset_name,
+                    solution_str=pred,
+                    ground_truth=ex,
+                    dataset=dataset_name,
+                )
+                if isinstance(score, (int, float)) and isfinite(score) and score >= 0.5:
+                    local_correct += 1
+
+    # 聚合: local_correct / local_total -> global_correct / global_total
+    t = torch.tensor(
+        [local_correct, local_total],
+        dtype=torch.float32,
+        device=device,
+    )
+    if world_size > 1:
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+    global_correct, global_total = t.tolist()
+    if global_total == 0:
+        return 0.0
+    return global_correct / global_total
+
+# metrics.py 末尾加：
+if __name__ == "__main__":
+    import argparse, json, os
+    import torch
+    import torch.distributed as dist
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_or_ckpt", type=str, required=True)
+    parser.add_argument("--tokenizer_id", type=str, default=None)
+    parser.add_argument("--file_path", type=str, required=True)
+    parser.add_argument("--prompt_key", type=str, default="question")
+    parser.add_argument("--response_key", type=str, default="answer")
+    parser.add_argument("--max_samples", type=int, default=2048)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--max_length", type=int, default=40960)
+    parser.add_argument("--truncate_mode", type=str, default="truncate")
+    parser.add_argument("--max_prompt_length", type=int, default=40960)
+    parser.add_argument("--max_new_tokens", type=int, default=8192)
+    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--output", type=str, required=True)
+    args = parser.parse_args()
+
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+
+    # 这里假设你的 compute_* 已经内部做了 all_reduce
+    H = compute_policy_entropy_on_parquet_or_jsonl(
+        model_or_ckpt=args.model_or_ckpt,
+        tokenizer_id=args.tokenizer_id,
+        file_path=args.file_path,
+        prompt_key=args.prompt_key,
+        response_key=args.response_key,
+        device=f"cuda:{local_rank}",
+        dtype=args.dtype,
+        max_samples=args.max_samples,
+        batch_size=args.batch_size,
+        max_length=args.max_length,
+        truncate_mode=args.truncate_mode,
+    )
+
+    P = compute_accuracy_on_parquet_or_jsonl(
+        model_or_ckpt=args.model_or_ckpt,
+        tokenizer_id=args.tokenizer_id,
+        file_path=args.file_path,
+        prompt_key=args.prompt_key,
+        device=f"cuda:{local_rank}",
+        dtype=args.dtype,
+        max_samples=args.max_samples,
+        batch_size=args.batch_size,
+        max_prompt_length=args.max_prompt_length,
+        max_new_tokens=args.max_new_tokens,
+        data_source_key="data_source",
+    )
+
+    if dist.get_rank() == 0:
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump({"H": H, "P": P}, f)
+
+    dist.destroy_process_group()

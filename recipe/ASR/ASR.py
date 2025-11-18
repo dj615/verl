@@ -197,9 +197,46 @@ def build_sft_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
         "trainer.project_name=ASR_SFT",
         f"trainer.experiment_name=phase_{phase}",
         f"trainer.default_local_dir={str(ckpt_out)}",
+        f"trainer.log_freq={args.log_every_n_steps}",
     ])
     return " ".join(str(p) for p in parts if p)
 
+def run_distributed_eval(model_or_ckpt: str, tokenizer_id: str, args, work: Path, phase: int):
+    """
+    用 torchrun 多机多卡跑一次 eval（policy entropy + accuracy），
+    结果写到 work/eval_phase_{phase}.json 再读回来。
+    """
+    out_file = work / f"eval_phase_{phase}.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    parts = [
+        "torchrun",
+        f"--nnodes={args.rl_trainer_nnodes}",
+        f"--nproc_per_node={args.rl_trainer_n_gpus_per_node}",
+        f"--node_rank={args.sft_node_rank}",
+        f"--master_addr={args.sft_master_addr}",
+        f"--master_port={args.sft_master_port}",
+        "-m", "recipe.ASR.metrics",
+        f"--model_or_ckpt={model_or_ckpt}",
+        f"--tokenizer_id={tokenizer_id}",
+        f"--file_path={args.d2_val}",
+        f"--prompt_key={args.prompt_key_d2}",
+        f"--response_key={args.response_key_d2}",
+        f"--max_samples={args.max_eval_samples}",
+        f"--batch_size={args.eval_batch_size}",
+        f"--max_length={args.max_length}",
+        f"--truncate_mode={args.truncate_mode}",
+        f"--max_prompt_length={args.rl_max_prompt_length}",
+        f"--max_new_tokens={args.rl_max_response_length}",
+        f"--dtype={args.dtype}",
+        f"--output={out_file}",
+    ]
+    cmd = " ".join(str(p) for p in parts if p)
+    run_cmd(cmd)
+
+    with open(out_file, "r", encoding="utf-8") as f:
+        j = json.load(f)
+    return j["H"], j["P"]
 
 def build_rl_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
     lora_rank = args.rl_lora_rank if args.rl_lora_enable == 1 else 0
@@ -262,7 +299,8 @@ def build_rl_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
         f"trainer.default_local_dir={str(ckpt_out)}",
         f"trainer.n_gpus_per_node={args.rl_trainer_n_gpus_per_node}",
         f"trainer.nnodes={args.rl_trainer_nnodes}",
-        "trainer.save_freq=5",
+        f"trainer.save_freq={args.validation_steps}",
+        f"trainer.log_freq={args.log_every_n_steps}",
     ]
     return " ".join(str(p) for p in parts if p)
 
@@ -281,7 +319,7 @@ def main():
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--schedule_mode", type=str, default="ASR", choices=["ASR"])
-    parser.add_argument("--log_every_n_steps", type=int, default=5, help="每 N 次梯度更新后实时 log 一次到 wandb（默认 10）")
+    parser.add_argument("--log_every_n_steps", type=int, default=5, help="每 N 次梯度更新后实时 log 一次到 wandb")
     parser.add_argument("--early_patience", type=int, default=5, help="连续 early_patience 次 Pn 下降则提前停止训练（基于 D2 validation 的 Pn）。")
     parser.add_argument("--validation_strategy", type=str, default="steps", choices=["epochs", "steps"])
     parser.add_argument("--max_training_steps", type=int, default=2000)
@@ -289,11 +327,10 @@ def main():
     parser.add_argument("--max_phases", type=int, default=10)
     parser.add_argument("--sft_epochs", type=int, default=1)
     parser.add_argument("--rl_epochs", type=int, default=1)
-    parser.add_argument("--main_node_address", type=str, default=None, help="主节点 IP 地址；多机用")
 
     # ===== 数据集 =====
-    parser.add_argument("--sft_task", type=str, choices=["DAPO_MATH", "gsm8k", "HARP", "MATH", "NuminaMath_1.5", "NuminaMath_CoT", "OpenR1_Math_220k", "openscience"], requires=True)
-    parser.add_argument("--rl_task", type=str, choices=["DAPO_MATH", "gsm8k", "HARP", "MATH", "NuminaMath_1.5", "NuminaMath_CoT", "OpenR1_Math_220k", "openscience"], requires=True)
+    parser.add_argument("--sft_task", type=str, choices=["DAPO_MATH", "gsm8k", "HARP", "MATH", "NuminaMath_1.5", "NuminaMath_CoT", "OpenR1_Math_220k", "openscience"], required=True)
+    parser.add_argument("--rl_task", type=str, choices=["DAPO_MATH", "gsm8k", "HARP", "MATH", "NuminaMath_1.5", "NuminaMath_CoT", "OpenR1_Math_220k", "openscience"], required=True)
     parser.add_argument("--d1_train", type=str, default=None)
     parser.add_argument("--d1_val", type=str, default=None)
     parser.add_argument("--d2_train", type=str, default=None)
@@ -385,8 +422,8 @@ def main():
     if args.sft_ckpt_dir is None or args.rl_ckpt_dir is None:
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.sft_ckpt_dir = f"sft_{args.task}_{timestamp}"
-        args.rl_ckpt_dir = f"rl_{args.task}_{timestamp}"
+        args.sft_ckpt_dir = f"ASR_sft_{args.task}_{timestamp}"
+        args.rl_ckpt_dir = f"ASR_rl_{args.task}_{timestamp}"
     
     args.d1_train = f"/root/workspace/ASR_data/train/{args.sft_task}.jsonl"
     args.d1_valid = f"/root/workspace/ASR_data/valid/{args.sft_task}.jsonl"
@@ -401,10 +438,6 @@ def main():
             raise ValueError("validation_strategy == 'steps' 时，validation_steps 必须 > 0")
         if args.max_training_steps <= 0:
             raise ValueError("validation_strategy == 'steps' 时，max_training_steps 必须 > 0")
-    
-    if args.main_node_address:
-        args.sft_master_addr = args.main_node_address
-        args.rl_ray_address = args.main_node_address
 
     def get_tokenizer_id_for_ckpt(model_or_ckpt: str, explicit_tokenizer: Optional[str] = None) -> str:
         """
@@ -520,31 +553,12 @@ def main():
     base_model = resolve_model_arg(args.base_model_or_ckpt)
 
     tok0 = get_tokenizer_id_for_ckpt(base_model, args.tokenizer)
-    H0 = compute_policy_entropy_on_parquet_or_jsonl(
+    H0, P0 = run_distributed_eval(
         model_or_ckpt=base_model,
         tokenizer_id=tok0,
-        file_path=args.d2_val,
-        prompt_key=args.prompt_key_d2,
-        response_key=args.response_key_d2,
-        device=args.device,
-        dtype=args.dtype,
-        max_samples=args.max_eval_samples,
-        batch_size=args.eval_batch_size,
-        max_length=args.max_length,
-        truncate_mode=args.truncate_mode,
-    )
-    P0 = compute_accuracy_on_parquet_or_jsonl(
-        model_or_ckpt=base_model,
-        tokenizer_id=tok0,
-        file_path=args.d2_val,
-        prompt_key=args.prompt_key_d2,
-        device=args.device,
-        dtype=args.dtype,
-        max_samples=args.max_eval_samples,
-        batch_size=args.eval_batch_size,
-        max_prompt_length=args.rl_max_prompt_length,
-        max_new_tokens=args.rl_max_response_length,
-        data_source_key="data_source",
+        args=args,
+        work=work,
+        phase=0,
     )
 
     # 固定阈值：Hf = 0.27 * H0, Pf = P0
@@ -715,31 +729,12 @@ def main():
 
         # --- 用合并后的 HF 模型在 D2 val 上重新评估 H_n, P_n，用于下一阶段决策 ---
         tok_n = get_tokenizer_id_for_ckpt(current_ckpt, args.tokenizer)
-        Hn = compute_policy_entropy_on_parquet_or_jsonl(
+        Hn, Pn = run_distributed_eval(
             model_or_ckpt=current_ckpt,
             tokenizer_id=tok_n,
-            file_path=args.d2_val,
-            prompt_key=args.prompt_key_d2,
-            response_key=args.response_key_d2,
-            device=args.device,
-            dtype=args.dtype,
-            max_samples=args.max_eval_samples,
-            batch_size=args.eval_batch_size,
-            max_length=args.max_length,
-            truncate_mode=args.truncate_mode,
-        )
-        Pn = compute_accuracy_on_parquet_or_jsonl(
-            model_or_ckpt=current_ckpt,
-            tokenizer_id=tok_n,
-            file_path=args.d2_val,
-            prompt_key=args.prompt_key_d2,
-            device=args.device,
-            dtype=args.dtype,
-            max_samples=args.max_eval_samples,
-            batch_size=args.eval_batch_size,
-            max_prompt_length=args.rl_max_prompt_length,
-            max_new_tokens=args.rl_max_response_length,
-            data_source_key="data_source",
+            args=args,
+            work=work,
+            phase=n,
         )
 
         print(
