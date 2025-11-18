@@ -1,21 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-ASR.py — Alternating SFT/RL Controller (for VERL)
-
-功能（控制器，仅调度，不直接写训练逻辑）：
-  1. 在每个阶段结束后，用当前模型在：
-       - D2_val 上计算策略熵 H_n
-       - D2_val 上计算准确率 P_n
-  2. 根据阈值 H_f, G_f 决定下一阶段跑 SFT 还是 RL
-  3. 串联各阶段 checkpoint，使权重连续演化
-
-注意：
-- 本脚本会根据传入的 SFT/RL 超参数，构造调用：
-    verl.trainer.fsdp_sft_trainer
-    verl.trainer.main_ppo
-"""
-
-import argparse
+import argparse 
 import json
 import os
 import shlex
@@ -149,7 +132,7 @@ def latest_checkpoint(ckpt_dir: Path) -> Optional[Path]:
         return None
 
     cands = sorted(
-        [p for p in ckpt_dir.glob("**/*") if p.is_dir()],
+        [p for p in ckpt_dir.glob("**/*") if p.is_dir() ],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -185,6 +168,13 @@ def build_sft_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
             f"--master_port={args.sft_master_port}",
         ]
 
+    if getattr(args, "validation_strategy", None) == "steps":
+        trainer_step_cfg = f"trainer.total_training_steps={args.validation_steps}"
+    elif getattr(args, "validation_strategy", None) == "epochs":
+        trainer_step_cfg = f"trainer.total_epochs={args.sft_epochs}"
+    else:
+        raise ValueError("Only supports args.validation_strategy as epochs or steps.")
+
     parts.extend([
         "-m", "verl.trainer.fsdp_sft_trainer",
         f"data.train_batch_size={args.sft_batch_size}",
@@ -201,7 +191,7 @@ def build_sft_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
         f"optim.lr={args.sft_learning_rate}",
         "optim.lr_scheduler=constant" if not args.sft_lr_schedule else f"optim.lr_scheduler={args.sft_lr_schedule}",
         "optim.lr_warmup_steps_ratio=0.0",
-        f"trainer.total_epochs={args.sft_epochs}",
+        trainer_step_cfg,
         "trainer.resume_mode=disable",
         "trainer.logger=[console,wandb]",
         "trainer.project_name=ASR_SFT",
@@ -213,6 +203,13 @@ def build_sft_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
 
 def build_rl_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
     lora_rank = args.rl_lora_rank if args.rl_lora_enable == 1 else 0
+
+    if getattr(args, "validation_strategy", None) == "steps":
+        trainer_step_cfg = f"trainer.total_training_steps={args.validation_steps}"
+    elif getattr(args, "validation_strategy", None) == "epochs":
+        trainer_step_cfg = f"trainer.total_epochs={args.rl_epochs}"
+    else:
+        raise ValueError("Only supports args.validation_strategy as epochs or steps.")
 
     parts = [
         "python", "-m", "verl.trainer.main_ppo",
@@ -240,6 +237,7 @@ def build_rl_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
         f"actor_rollout_ref.actor.kl_loss_coef={args.rl_kl_coef}" if args.rl_use_kl_loss == 1 else "",
         f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={args.rl_micro_batch_size_per_gpu}",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={args.ppo_mini_batch_size}",
+        "actor_rollout_ref.actor.ppo_epochs=1"
         f"actor_rollout_ref.actor.optim.lr={args.rl_learning_rate}",
         "actor_rollout_ref.actor.optim.lr_scheduler_type=constant" if not args.rl_lr_schedule else f"actor_rollout_ref.actor.optim.lr_scheduler_type={args.rl_lr_schedule}",
         "actor_rollout_ref.actor.optim.lr_warmup_steps=0",
@@ -256,7 +254,7 @@ def build_rl_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
         f"actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={args.ref_log_prob_micro_batch_size_per_gpu}",
         f"algorithm.adv_estimator={args.rl_adv_estimator}",
         f"algorithm.kl_ctrl.kl_coef={args.rl_kl_coef}",
-        f"trainer.total_epochs={args.rl_epochs}",
+        trainer_step_cfg,
         "trainer.resume_mode=disable",
         "trainer.logger=[console,wandb]",
         f"trainer.project_name=ASR_RL",
@@ -264,7 +262,7 @@ def build_rl_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
         f"trainer.default_local_dir={str(ckpt_out)}",
         f"trainer.n_gpus_per_node={args.rl_trainer_n_gpus_per_node}",
         f"trainer.nnodes={args.rl_trainer_nnodes}",
-        "trainer.save_freq=5"
+        "trainer.save_freq=5",
     ]
     return " ".join(str(p) for p in parts if p)
 
@@ -277,20 +275,29 @@ def main():
     # ===== 基础参数 =====
     parser.add_argument("--base_model_or_ckpt", type=str, required=True)
     parser.add_argument("--tokenizer", type=str, default=None)
-    parser.add_argument("--work_dir", type=str, required=True)
-    parser.add_argument("--sft_ckpt_dir", type=str, default="ckpts_sft")
-    parser.add_argument("--rl_ckpt_dir", type=str, default="ckpts_rl")
-    parser.add_argument("--max_phases", type=int, default=50)
+    parser.add_argument("--work_dir", type=str, default="/root/workspace/checkpoints")
+    parser.add_argument("--sft_ckpt_dir", type=str, default=None)
+    parser.add_argument("--rl_ckpt_dir", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--schedule_mode", type=str, default="ASR", choices=["ASR"])
-    parser.add_argument("--log_every_n_steps", type=int, default=10, help="每 N 次梯度更新后实时 log 一次到 wandb（默认 10）")
+    parser.add_argument("--log_every_n_steps", type=int, default=5, help="每 N 次梯度更新后实时 log 一次到 wandb（默认 10）")
+    parser.add_argument("--early_patience", type=int, default=5, help="连续 early_patience 次 Pn 下降则提前停止训练（基于 D2 validation 的 Pn）。")
+    parser.add_argument("--validation_strategy", type=str, default="steps", choices=["epochs", "steps"])
+    parser.add_argument("--max_training_steps", type=int, default=2000)
+    parser.add_argument("--validation_steps", type=int, default=100, help="step-wise 验证间隔（单位：梯度更新步数）")
+    parser.add_argument("--max_phases", type=int, default=10)
+    parser.add_argument("--sft_epochs", type=int, default=1)
+    parser.add_argument("--rl_epochs", type=int, default=1)
+    parser.add_argument("--main_node_address", type=str, default=None, help="主节点 IP 地址；多机用")
 
     # ===== 数据集 =====
-    parser.add_argument("--d1_train", type=str, required=True)
-    parser.add_argument("--d1_val", type=str, required=True)
-    parser.add_argument("--d2_train", type=str, required=True)
-    parser.add_argument("--d2_val", type=str, required=True)
+    parser.add_argument("--sft_task", type=str, choices=["DAPO_MATH", "gsm8k", "HARP", "MATH", "NuminaMath_1.5", "NuminaMath_CoT", "OpenR1_Math_220k", "openscience"], requires=True)
+    parser.add_argument("--rl_task", type=str, choices=["DAPO_MATH", "gsm8k", "HARP", "MATH", "NuminaMath_1.5", "NuminaMath_CoT", "OpenR1_Math_220k", "openscience"], requires=True)
+    parser.add_argument("--d1_train", type=str, default=None)
+    parser.add_argument("--d1_val", type=str, default=None)
+    parser.add_argument("--d2_train", type=str, default=None)
+    parser.add_argument("--d2_val", type=str, default=None)
     parser.add_argument("--prompt_key_d1", type=str, default="question")
     parser.add_argument("--response_key_d1", type=str, default="answer")
     parser.add_argument("--prompt_key_d2", type=str, default="question")
@@ -298,53 +305,51 @@ def main():
 
     # ===== SFT 配置（映射到 sft_trainer.yaml）=====
     # Data Process
-    parser.add_argument("--sft_max_length", type=int, default=4096)
+    parser.add_argument("--sft_max_length", type=int, default=40960)
     parser.add_argument("--sft_truncation", type=str, default="right", choices=["error", "left", "right", "middle"], help="SFT 超过最大长度的样本处理方式（默认右截断）")
     # LoRA
     parser.add_argument("--sft_lora_enable", type=int, default=1)
     parser.add_argument("--sft_lora_rank", type=int, default=8)
     parser.add_argument("--sft_lora_alpha", type=int, default=16)
     # Batch / LR / Epoch
-    parser.add_argument("--sft_batch_size", type=int, default=64)
+    parser.add_argument("--sft_batch_size", type=int, default=32)
     parser.add_argument("--sft_micro_batch_size_per_gpu", type=int, default=1)
-    parser.add_argument("--sft_learning_rate", type=float, default=5e-5)
+    parser.add_argument("--sft_learning_rate", type=float, default=5e-6)
     parser.add_argument("--sft_lr_schedule", type=str, default="constant")
-    parser.add_argument("--sft_epochs", type=int, default=1)
-    # 多机多卡（只有多机才需要更改以下配置）
-    parser.add_argument("--sft_nproc_per_node", type=int, default=1)
-    parser.add_argument("--sft_nnodes", type=int, default=1, help="一共几台机器")
+    # 多机多卡
+    parser.add_argument("--sft_nproc_per_node", type=int, default=8)
+    parser.add_argument("--sft_nnodes", type=int, default=4, help="一共几台机器")
     parser.add_argument("--sft_node_rank", type=int, default=0, help="当前机器的序号（从 0 开始）")
-    parser.add_argument("--sft_master_addr", type=str, default="127.0.0.1", help="告诉所有节点主节点的 IP 地址")
+    parser.add_argument("--sft_master_addr", type=str, default=None, help="告诉所有节点主节点的 IP 地址")
     parser.add_argument("--sft_master_port", type=str, default="29500", help="各节点通过此端口通信，未被占用即可")
 
     # ===== RL 配置（映射到 ppo_trainer.yaml + main_ppo）=====
-    parser.add_argument("--rl_rollout_gpu_memory_utilization", type=float, default=0.2, help="映射到 actor_rollout_ref.rollout.gpu_memory_utilization。对于 vLLM：表示 vLLM 实例使用的 GPU 显存占比。如果启动时提示显存不足，就把这个值再调小一些。")
+    parser.add_argument("--rl_rollout_gpu_memory_utilization", type=float, default=0.5, help="映射到 actor_rollout_ref.rollout.gpu_memory_utilization。对于 vLLM：表示 vLLM 实例使用的 GPU 显存占比。如果启动时提示显存不足，就把这个值再调小一些。")
     # Data Process
     parser.add_argument("--rl_train_max_samples", type=int, default=-1, help="RL 阶段最大训练样本数，-1 表示使用全部数据")
     parser.add_argument("--rl_val_max_samples", type=int, default=-1, help="RL 阶段最大验证样本数，-1 表示使用全部数据")
+    parser.add_argument("--rl_max_prompt_length", type=int, default=40960)
+    parser.add_argument("--rl_max_response_length", type=int, default=8192)
     parser.add_argument("--rl_filter_overlong_prompts", action="store_true", default=True, help="RL 是否过滤过长 prompt 样本（默认开启）")
     parser.add_argument("--rl_filter_overlong_prompts_workers", type=int, default=2, help="RL 过滤过长样本时的并行 worker 数量")
     parser.add_argument("--rl_truncation", type=str, default="right", choices=["error", "left", "right", "middle"], help="RL 超过最大长度的样本处理方式（默认右截断）")
     parser.add_argument("--rl_image_key", type=str, default="images", help="RL 多模态输入中图像字段名（若有）")
     # LoRA
     parser.add_argument("--rl_lora_enable", type=int, default=1)
-    parser.add_argument("--rl_lora_rank", type=int, default=8)
+    parser.add_argument("--rl_lora_rank", type[int], default=8)
     parser.add_argument("--rl_lora_alpha", type=int, default=16)
     # Batch / LR / Epoch
-    parser.add_argument("--rl_batch_size", type=int, default=64)
-    parser.add_argument("--ppo_mini_batch_size", type=int, default=2)
-    parser.add_argument("--rl_micro_batch_size_per_gpu", type=int, default=1)
-    parser.add_argument("--ref_log_prob_micro_batch_size_per_gpu", type=int, default=1)
-    parser.add_argument("--rollout_log_prob_micro_batch_size_per_gpu", type=int, default=1)
-    parser.add_argument("--rl_learning_rate", type=float, default=5e-5)
+    parser.add_argument("--rl_batch_size", type=int, default=128)
+    parser.add_argument("--ppo_mini_batch_size", type=int, default=32)
+    parser.add_argument("--rl_micro_batch_size_per_gpu", type=int, default=2)
+    parser.add_argument("--ref_log_prob_micro_batch_size_per_gpu", type=int, default=2)
+    parser.add_argument("--rollout_log_prob_micro_batch_size_per_gpu", type=int, default=2)
+    parser.add_argument("--rl_learning_rate", type=float, default=5e-6)
     parser.add_argument("--rl_lr_schedule", type=str, default="constant")
-    parser.add_argument("--rl_epochs", type=int, default=1)
-    parser.add_argument("--rl_max_prompt_length", type=int, default=512)
-    parser.add_argument("--rl_max_response_length", type=int, default=512)
     # Algo & KL (GRPO 风格)
     parser.add_argument("--rl_adv_estimator", type=str, default="grpo")
     parser.add_argument("--rl_use_kl_loss", type=int, default=1)
-    parser.add_argument("--rl_kl_coef", type=float, default=0.02)
+    parser.add_argument("--rl_kl_coef", type=float, default=0.001)
     # Rollout 采样参数
     parser.add_argument("--rl_rollout_n", type=int, default=8)
     parser.add_argument("--rl_rollout_temperature", type=float, default=1.0)
@@ -353,28 +358,53 @@ def main():
     # 自定义 reward function，通过 Verl 的 custom_reward_function 接口
     parser.add_argument("--rl_reward_fn_path", type=str, default="recipe/ASR/metrics.py")
     parser.add_argument("--rl_reward_fn_name", type=str, default="compute_score")
-    # 多机多卡（只有多机才需要更改以下配置）
-    parser.add_argument("--rl_rollout_tensor_model_parallel_size", type=int, default=1, help="映射到 actor_rollout_ref.rollout.tensor_model_parallel_size；必须整除 trainer.n_gpus_per_node * trainer.nnodes。单卡训练请保持为 1。")
-    parser.add_argument("--rl_trainer_nnodes", type=int, default=1)
-    parser.add_argument("--rl_trainer_n_gpus_per_node", type=int, default=1)
-    parser.add_argument("--rl_ray_address", type=str, default=None, help="告诉 Ray 客户端如何连接 Ray 集群。Ray 会根据这个字符串调用 ray.init(address=...)")  # 比如 "auto" 或 "ray://..."
+    # 多机多卡
+    parser.add_argument("--rl_ray_address", type=str, default=None, help="告诉 Ray 客户端如何连接 Ray 集群。Ray 会根据这个字符串调用 ray.init(address=...)")
+    parser.add_argument("--rl_rollout_tensor_model_parallel_size", type=int, default=1, help="映射到 actor_rollout_ref.rollout.tensor_model_parallel_size；必须整除 trainer.n_gpus_per_node * trainer.nnodes")
+    parser.add_argument("--rl_trainer_nnodes", type=int, default=4)
+    parser.add_argument("--rl_trainer_n_gpus_per_node", type=int, default=8)
     parser.add_argument("--rl_ray_num_cpus", type=int, default=None, help="限制 Ray 在当前节点上最多使用多少 CPU 核；None 表示自动检测可用 CPU 数")
 
     # ===== 指标计算 =====
-    parser.add_argument("--max_eval_samples", type=int, default=2048)
-    parser.add_argument("--eval_batch_size", type=int, default=4)
-    parser.add_argument("--max_length", type=int, default=4096)
+    parser.add_argument("--max_eval_samples", type[int], default=2048)
+    parser.add_argument("--eval_batch_size", type[int], default=4)
+    parser.add_argument("--max_length", type[int], default=40960, help="只计算 len(prompt + response) < max_length 的数据")
     parser.add_argument("--truncate_mode", type=str, default="skip", choices=["truncate", "skip"])
 
     # ===== wandb =====
-    parser.add_argument("--wandb_project", type=str, default=None)
-    parser.add_argument("--wandb_run_name", type=str, default=None)
-    parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb_project", type=str, default="ASR")
+    parser.add_argument("--wandb_run_name", type[str], default=None)
+    parser.add_argument("--wandb_mode", type[str], default="online", choices=["online", "offline", "disabled"])
 
     # ===== 保存策略 =====
     parser.add_argument("--save_strategy", type=str, default="best_on_D2", choices=["best_on_D2"], help="best_on_D2: 额外保留一份在 D2 val 上 accuracy 最好的 HF ckpt（保存在 work_dir/best_ckpt_D2）。")
 
     args = parser.parse_args()
+
+    # ---- 一些 sanity check ----
+    if args.sft_ckpt_dir is None or args.rl_ckpt_dir is None:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.sft_ckpt_dir = f"sft_{args.task}_{timestamp}"
+        args.rl_ckpt_dir = f"rl_{args.task}_{timestamp}"
+    
+    args.d1_train = f"/root/workspace/ASR_data/train/{args.sft_task}.jsonl"
+    args.d1_valid = f"/root/workspace/ASR_data/valid/{args.sft_task}.jsonl"
+    args.d2_train = f"/root/workspace/ASR_data/train/{args.rl_task}.jsonl"
+    args.d2_valid = f"/root/workspace/ASR_data/valid/{args.rl_task}.jsonl"
+
+    if args.wandb_run_name is None:
+        args.wandb_run_name = f"sft_{args.sft_task}_rl_{args.rl_task}"
+
+    if args.validation_strategy == "steps":
+        if args.validation_steps <= 0:
+            raise ValueError("validation_strategy == 'steps' 时，validation_steps 必须 > 0")
+        if args.max_training_steps <= 0:
+            raise ValueError("validation_strategy == 'steps' 时，max_training_steps 必须 > 0")
+    
+    if args.main_node_address:
+        args.sft_master_addr = args.main_node_address
+        args.rl_ray_address = args.main_node_address
 
     def get_tokenizer_id_for_ckpt(model_or_ckpt: str, explicit_tokenizer: Optional[str] = None) -> str:
         """
@@ -444,6 +474,14 @@ def main():
     print(f"    effective train samples: {_fmt(rl_effective_train)}")
     print(f"    global batch size: {rl_global_batch}")
     print(f"    estimated grad update steps (per all epochs): {_fmt(rl_steps_per_epoch)}")
+    print()
+    print(f"  validation_strategy: {args.validation_strategy}")
+    if args.validation_strategy == 'steps':
+        print(f"    validation_steps: {args.validation_steps}")
+        print(f"    max_training_steps: {args.max_training_steps}")
+    else:
+        print(f"    max_phases (epoch-wise): {args.max_phases}")
+    print(f"  early_patience: {args.early_patience}")
     print("=" * 60, flush=True)
 
     # ===== wandb init =====
@@ -456,6 +494,10 @@ def main():
                 "schedule_mode": "ASR",
                 "Hf_ratio": 0.27,
                 "max_phases": args.max_phases,
+                "validation_strategy": args.validation_strategy,
+                "validation_steps": args.validation_steps,
+                "max_training_steps": args.max_training_steps,
+                "early_patience": args.early_patience,
             },
         )
     else:
@@ -531,6 +573,10 @@ def main():
     num_sft_done = 0
     num_rl_done = 0
 
+    # 早停相关
+    patience_counter = 0  # 连续 Pn 上升的次数
+    total_steps_done = 0  # 仅在 validation_strategy == 'steps' 时使用
+
     # 记录 phase 0 到 alt_log
     with open(work / "alt_log.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps({
@@ -545,6 +591,18 @@ def main():
 
     # ===== 交替训练循环 =====
     for n in range(1, args.max_phases + 1):
+        # --- 当使用 step-wise 验证时，检查总步数预算是否耗尽 ---
+        if args.validation_strategy == "steps" and total_steps_done >= args.max_training_steps:
+            print(
+                f"[Early Stop] Reached max_training_steps={args.max_training_steps} "
+                f"(total_steps_done={total_steps_done}), stop alternation.",
+                flush=True,
+            )
+            break
+
+        # 记录上一轮的 P，用于 early_patience（注意：phase 0 的 P0 也参与比较）
+        prev_P = current_P
+
         # --- 根据上一轮的度量决定本阶段跑 SFT 还是 RL ---
         if current_P > Pf and current_H > Hf:
             stage = "RL"   # Pn > Pf 且 Hn > Hf -> 下一阶段 RL（在 D2 train 上做 RL）
@@ -568,6 +626,7 @@ def main():
             "next_stage_is_rl": 1 if stage == "RL" else 0,
             "num_sft_done": num_sft_done,
             "num_rl_done": num_rl_done,
+            "total_training_steps_so_far": total_steps_done,
         })
 
         # --- 运行一个 SFT 或 RL 子阶段 ---
@@ -581,6 +640,14 @@ def main():
             cmd = build_rl_cmd(args, current_ckpt, ckpt_out, phase=n)
 
         run_cmd(cmd)
+
+        # step-wise 情况下，累计已训练步数
+        if args.validation_strategy == "steps":
+            total_steps_done += args.validation_steps
+            wandb.log({
+                "phase": n,
+                "total_training_steps_so_far": total_steps_done,
+            })
 
         # --- 读 summary.json，log 子训练曲线 ---
         summary_file = ckpt_out / "summary.json"
@@ -635,7 +702,6 @@ def main():
         else:
             # RL：始终用 base_model_or_ckpt 提供 HF config
             merge_fsdp_to_hf(fsdp_ckpt, current_hf_dir, hf_model_config_path=args.base_model_or_ckpt)
-
 
         # 合并成功后，删除本阶段的 FSDP ckpt 目录（包括其中的所有 step/epoch ckpt）
         try:
@@ -719,10 +785,32 @@ def main():
                 "time": int(time.time()),
             }, ensure_ascii=False) + "\n")
 
+        # ---- early_patience: 连续 Pn 下降就累加，否则清零 ----
+        if Pn < prev_P:
+            patience_counter += 1
+        else:
+            patience_counter = 0
+
+        wandb.log({
+            "phase": n,
+            "Pn": Pn,
+            "prev_P": prev_P,
+            "early_patience_counter": patience_counter,
+        })
+
         current_H = Hn
         current_P = Pn
 
         print(f"[Phase {n}] Updated current_ckpt -> {current_ckpt}", flush=True)
+
+        # 若 patience_counter 达到阈值，则提前停止交替训练
+        if args.early_patience > 0 and patience_counter >= args.early_patience:
+            print(
+                f"[Early Stop] Pn has increased for {patience_counter} consecutive phases "
+                f"(>= early_patience={args.early_patience}), stop alternation.",
+                flush=True,
+            )
+            break
 
     # ===== 总结 =====
     total_time = time.time() - start_time
@@ -743,71 +831,8 @@ def main():
             # 没有任何 phase 超过初始模型，则 best 仍然是 base_model_or_ckpt
             print(f"[Done] Best D2 checkpoint is the initial model_or_ckpt: {best_D2_ckpt}")
     
-    print(f"[Done] Finished {args.max_phases} phases. Final checkpoint: {current_ckpt}")
+    print(f"[Done] Finished alternation. Final checkpoint: {current_ckpt}")
+
 
 if __name__ == "__main__":
     main()
-
-
-"""
-准备数据 (需要是 parquet 格式)：
-{
-"question": "...", 
-"answer": "...", 
-"groundtruth": "9", 
-"data_source": "EleutherAI/hendrycks_math", 
-"ability": "math", 
-"reward_model": {"style": "rule", "ground_truth": "9"}, 
-"extra_info": {"subset": "algebra", "level": "Level 3", "split": "train"}
-}
-
-对于 normalization 逻辑请参考：
-verl/recipe/ASR/metrics.py
-
-多机多卡运行示例：
-假设2机，每台机器8张卡。
-在主节点执行：
-ray start --head --port=6379
-得到：
-To connect to this Ray cluster, run:
-    ray start --address='10.0.0.3:6379'
-在从节点执行：
-ray start --address='10.0.0.3:6379'
-得到主节点的IP地址：
-10.0.0.3
-在主（从）节点上运行：
-python -m recipe.ASR.ASR \
-  --base_model_or_ckpt Qwen/Qwen3-0.6B \
-  --work_dir /root/workspace/checkpoints/ASR_MATH \
-  --d1_train /root/workspace/ASR_data/train/MATH.parquet \
-  --d1_val /root/workspace/ASR_data/valid/MATH.parquet \
-  --d2_train /root/workspace/ASR_data/train/MATH.parquet \
-  --d2_val /root/workspace/ASR_data/valid/MATH.parquet \
-  --sft_lora_rank 2 \
-  --sft_lora_alpha 4 \
-  --sft_batch_size 2 \
-  --sft_micro_batch_size_per_gpu 1 \
-  --sft_learning_rate 5e-5 \
-  --sft_lr_schedule "constant" \
-  --sft_max_length 512 \
-  --sft_nproc_per_node 1 \
-  --sft_nnodes 1 \
-  --sft_node_rank 0 \
-  --sft_master_addr 10.0.0.3 \
-  --sft_master_port 29500 \
-  --rl_lora_rank 2 \
-  --rl_lora_alpha 4 \
-  --rl_batch_size 4 \
-  --rl_learning_rate 5e-5 \
-  --rl_lr_schedule "constant" \
-  --rl_max_prompt_length 512 \
-  --rl_max_response_length 2048 \
-  --rl_rollout_n 2 \
-  --rl_rollout_temperature 0.6 \
-  --rl_trainer_nnodes 1 \
-  --rl_trainer_n_gpus_per_node 1 \
-  --rl_ray_address "10.0.0.3:6379" \
-  --eval_batch_size 2 \
-  --wandb_project ASR \
-  --wandb_run_name MATH_Train
-"""
