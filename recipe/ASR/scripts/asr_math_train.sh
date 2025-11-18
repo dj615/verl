@@ -9,10 +9,10 @@ python -m recipe.ASR.ASR \
   --base_model_or_ckpt Qwen/Qwen3-0.6B \
   --schedule_mode ASR \
   --work_dir ASR_MATH \
-  --d1_train /root/workspace/ASR_data/train/hendrycks_math_train.parquet \
-  --d1_val /root/workspace/ASR_data/train/hendrycks_math_valid.parquet \
-  --d2_train /root/workspace/ASR_data/train/hendrycks_math_train.parquet \
-  --d2_val /root/workspace/ASR_data/train/hendrycks_math_valid.parquet \
+  --d1_train /root/workspace/ASR_data/train/MATH.parquet \
+  --d1_val /root/workspace/ASR_data/train/MATH.parquet \
+  --d2_train /root/workspace/ASR_data/train/MATH.parquet \
+  --d2_val /root/workspace/ASR_data/train/MATH.parquet \
   --sft_lora_rank 2 \
   --sft_lora_alpha 4 \
   --sft_batch_size 2 \
