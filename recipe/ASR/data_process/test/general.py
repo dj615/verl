@@ -129,7 +129,7 @@ if __name__ == "__main__":
         "math-ai/aime25": ["aime25", "test", None, "problem", "answer"],
         "math-ai/amc23": ["amc23", "test", None, "question", "answer"],
         "HuggingFaceH4/MATH-500": ["math500", "test", None, "problem", "answer"],
-        "KbsdJames/Omni-MATH": ["omni-math", "test", None, "problem", "answer"],
+        "KbsdJames/Omni-MATH": ["omni_math", "test", None, "problem", "answer"],
         "math-ai/minervamath": ["minerva", "test", None, "problem", "answer"],
     }
 

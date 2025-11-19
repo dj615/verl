@@ -9,28 +9,24 @@ from typing import Optional, Dict
 
 import wandb
 import shutil
-from transformers import AutoConfig
-
-from .metrics import compute_policy_entropy_on_parquet_or_jsonl, compute_ce_loss_on_parquet_or_jsonl, compute_accuracy_on_parquet_or_jsonl
 
 # ========== 基础工具函数 ==========
 
-def merge_fsdp_to_hf(fsdp_ckpt_dir: Path, target_dir: Path, hf_model_config_path: Optional[str] = None):
-    """
-    调用 verl 自带的 model_merger，将 FSDP ckpt 转成 HuggingFace 标准格式。
-
-    - 对 SFT ckpt：local_dir 里一般自带 huggingface/config.json，可以不传 hf_model_config_path。
-    - 对 RL ckpt：通常没有 huggingface/config.json，此时必须显式指定 hf_model_config_path，
-      比如初始的 base_model_or_ckpt（如 'Qwen/Qwen3-0.6B' 或某个本地 HF 目录）。
-    """
+def merge_fsdp_to_hf(fsdp_ckpt_dir: Path, target_dir: Path):
     target_dir.mkdir(parents=True, exist_ok=True)
+
+    actor_dir = fsdp_ckpt_dir
+    if (fsdp_ckpt_dir / "actor").is_dir():
+        actor_dir = fsdp_ckpt_dir / "actor"
+
     cmd = (
         "python -m verl.model_merger merge "
         f"--backend fsdp "
-        f"--local_dir {fsdp_ckpt_dir}/actor "
+        f"--local_dir {actor_dir} "
         f"--target_dir {target_dir}"
     )
     run_cmd(cmd)
+
 
 def _split_paths(paths_str: str):
     # 兼容逗号分隔或空格分隔（如果你未来想传多个文件）
@@ -274,7 +270,7 @@ def build_rl_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
         f"actor_rollout_ref.actor.kl_loss_coef={args.rl_kl_coef}" if args.rl_use_kl_loss == 1 else "",
         f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={args.rl_micro_batch_size_per_gpu}",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={args.ppo_mini_batch_size}",
-        "actor_rollout_ref.actor.ppo_epochs=1"
+        "actor_rollout_ref.actor.ppo_epochs=1",
         f"actor_rollout_ref.actor.optim.lr={args.rl_learning_rate}",
         "actor_rollout_ref.actor.optim.lr_scheduler_type=constant" if not args.rl_lr_schedule else f"actor_rollout_ref.actor.optim.lr_scheduler_type={args.rl_lr_schedule}",
         "actor_rollout_ref.actor.optim.lr_warmup_steps=0",
@@ -373,7 +369,7 @@ def main():
     parser.add_argument("--rl_image_key", type=str, default="images", help="RL 多模态输入中图像字段名（若有）")
     # LoRA
     parser.add_argument("--rl_lora_enable", type=int, default=1)
-    parser.add_argument("--rl_lora_rank", type[int], default=8)
+    parser.add_argument("--rl_lora_rank", type=int, default=8)
     parser.add_argument("--rl_lora_alpha", type=int, default=16)
     # Batch / LR / Epoch
     parser.add_argument("--rl_batch_size", type=int, default=128)
@@ -403,15 +399,15 @@ def main():
     parser.add_argument("--rl_ray_num_cpus", type=int, default=None, help="限制 Ray 在当前节点上最多使用多少 CPU 核；None 表示自动检测可用 CPU 数")
 
     # ===== 指标计算 =====
-    parser.add_argument("--max_eval_samples", type[int], default=2048)
-    parser.add_argument("--eval_batch_size", type[int], default=4)
-    parser.add_argument("--max_length", type[int], default=40960, help="只计算 len(prompt + response) < max_length 的数据")
+    parser.add_argument("--max_eval_samples", type=int, default=2048)
+    parser.add_argument("--eval_batch_size", type=int, default=4)
+    parser.add_argument("--max_length", type=int, default=40960, help="只计算 len(prompt + response) < max_length 的数据")
     parser.add_argument("--truncate_mode", type=str, default="skip", choices=["truncate", "skip"])
 
     # ===== wandb =====
     parser.add_argument("--wandb_project", type=str, default="ASR")
-    parser.add_argument("--wandb_run_name", type[str], default=None)
-    parser.add_argument("--wandb_mode", type[str], default="online", choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
 
     # ===== 保存策略 =====
     parser.add_argument("--save_strategy", type=str, default="best_on_D2", choices=["best_on_D2"], help="best_on_D2: 额外保留一份在 D2 val 上 accuracy 最好的 HF ckpt（保存在 work_dir/best_ckpt_D2）。")
@@ -419,16 +415,17 @@ def main():
     args = parser.parse_args()
 
     # ---- 一些 sanity check ----
-    if args.sft_ckpt_dir is None or args.rl_ckpt_dir is None:
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.sft_ckpt_dir = f"ASR_sft_{args.task}_{timestamp}"
-        args.rl_ckpt_dir = f"ASR_rl_{args.task}_{timestamp}"
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.sft_ckpt_dir is None:
+        args.sft_ckpt_dir = f"ASR_sft_{args.sft_task}_{timestamp}"
+    if args.rl_ckpt_dir is None:
+        args.rl_ckpt_dir = f"ASR_rl_{args.rl_task}_{timestamp}"
     
     args.d1_train = f"/root/workspace/ASR_data/train/{args.sft_task}.jsonl"
-    args.d1_valid = f"/root/workspace/ASR_data/valid/{args.sft_task}.jsonl"
+    args.d1_val   = f"/root/workspace/ASR_data/valid/{args.sft_task}.jsonl"
     args.d2_train = f"/root/workspace/ASR_data/train/{args.rl_task}.jsonl"
-    args.d2_valid = f"/root/workspace/ASR_data/valid/{args.rl_task}.jsonl"
+    args.d2_val   = f"/root/workspace/ASR_data/valid/{args.rl_task}.jsonl"
 
     if args.wandb_run_name is None:
         args.wandb_run_name = f"sft_{args.sft_task}_rl_{args.rl_task}"
@@ -712,10 +709,10 @@ def main():
                     f"fallback to base_model_or_ckpt={args.base_model_or_ckpt} as HF config source.",
                     flush=True,
                 )
-                merge_fsdp_to_hf(fsdp_ckpt, current_hf_dir, hf_model_config_path=args.base_model_or_ckpt)
+                merge_fsdp_to_hf(fsdp_ckpt, current_hf_dir)
         else:
             # RL：始终用 base_model_or_ckpt 提供 HF config
-            merge_fsdp_to_hf(fsdp_ckpt, current_hf_dir, hf_model_config_path=args.base_model_or_ckpt)
+            merge_fsdp_to_hf(fsdp_ckpt, current_hf_dir)
 
         # 合并成功后，删除本阶段的 FSDP ckpt 目录（包括其中的所有 step/epoch ckpt）
         try:
@@ -747,7 +744,7 @@ def main():
             if (best_D2_acc is None) or (Pn > best_D2_acc):
                 best_D2_acc = Pn
                 best_D2_ckpt = current_ckpt
-                best_D2_hf_dir = work / "best_ckpt_D2"
+                best_D2_hf_dir = work / f"best_{args.sft_task}_{args.rl_task}_lora_{args.sft_lora_enable}_{args.rl_lora_enable}_ckpt_on_D2"
 
                 if best_D2_hf_dir.exists():
                     shutil.rmtree(best_D2_hf_dir)

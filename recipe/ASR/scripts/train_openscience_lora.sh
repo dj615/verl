@@ -9,6 +9,8 @@ python -m recipe.ASR.ASR \
   --base_model_or_ckpt Qwen/Qwen3-8B \
   --sft_master_addr <address> \
   --rl_ray_address <address:port> \
+  --sft_ckpt_dir openscience_ASR_lora_sft \
+  --rl_ckpt_dir openscience_ASR_lora_rl \
   --sft_task openscience \
   --rl_task openscience \
   --sft_master_port 29500 \
