@@ -12,6 +12,7 @@ import shutil
 
 from .metrics import (
     compute_ce_loss_on_parquet_or_jsonl,
+    compute_accuracy_on_parquet_or_jsonl,
 )
 
 # ========== 基础工具函数 ==========
@@ -307,6 +308,7 @@ def main():
     parser.add_argument("--rl_ckpt_dir", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--best_rl_hf_subdir", type=str, default=None, help="相对于 work_dir 的子目录名，用于保存最佳 RL HF 合并后的 HF 模型")
 
     # ===== 数据集 =====
     parser.add_argument("--sft_task", type=str, choices=["DAPO_MATH", "gsm8k", "HARP", "MATH", "NuminaMath_1.5", "NuminaMath_CoT", "OpenR1_Math_220k", "openscience"], required=True)
@@ -393,6 +395,9 @@ def main():
     parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
 
     args = parser.parse_args()
+
+    if args.best_rl_hr_subdir is None:
+        args.best_rl_hr_subdir = f"Two_{args.sft_task}_{args.rl_dir}_lora_{args.sft_lora_enable}_{args.rl_lora_enable}_best_ckpt_on_D2"
 
     if args.sft_ckpt_dir is None or args.rl_ckpt_dir is None:
         from datetime import datetime
@@ -541,6 +546,81 @@ def main():
     run_cmd(rl_cmd)
     print("[Stage 3] RL training finished.", flush=True)
 
+    # ===== 阶段 4：遍历所有 RL ckpt，在 D2 val 上计算 accuracy，选出最优并只保留它 =====
+    print("[Stage 4] Selecting best RL checkpoint on D2 (accuracy)...", flush=True)
+
+    rl_actor_ckpts = list_fsdp_actor_ckpts(rl_ckpts_root)
+    if not rl_actor_ckpts:
+        raise RuntimeError(f"No FSDP actor checkpoints found under {rl_ckpts_root}")
+
+    tmp_rl_hf_dir = work / "tmp_rl_hf"
+    best_rl_hf_dir = work / "best_rl_on_D2"
+    best_acc = None
+    best_rl_step = None
+    best_rl_fsdp_dir = None
+
+    for actor_dir in rl_actor_ckpts:
+        step_name = actor_dir.parent.name
+        print(f"[Stage 4] Evaluating RL checkpoint: {actor_dir} (parent={step_name})", flush=True)
+
+        # 清空临时 HF 目录
+        if tmp_rl_hf_dir.exists():
+            shutil.rmtree(tmp_rl_hf_dir)
+
+        # 将当前 FSDP actor ckpt merge 成 HF 格式
+        merge_fsdp_to_hf(actor_dir, tmp_rl_hf_dir)
+
+        tok_id = get_tokenizer_id_for_ckpt(str(tmp_rl_hf_dir), args.tokenizer)
+        acc = compute_accuracy_on_parquet_or_jsonl(
+            model_or_ckpt=str(tmp_rl_hf_dir),
+            tokenizer_id=tok_id,
+            file_path=args.d2_val,
+            prompt_key=args.prompt_key_d2,
+            response_key=args.response_key_d2,
+            device=args.device,
+            dtype=args.dtype,
+            max_samples=args.max_eval_samples,
+            batch_size=args.eval_batch_size,
+            max_length=args.max_length,
+            truncate_mode=args.truncate_mode,
+        )
+
+        print(f"[Stage 4]  {step_name}  ACC (D2 val) = {acc:.6f}", flush=True)
+        wandb.log({
+            "rl_ckpt_step_name": step_name,
+            "rl_acc_on_D2": acc,
+        })
+
+        # 维护当前最优
+        if (best_acc is None) or (acc > best_acc):
+            best_acc = acc
+            best_rl_step = step_name
+            best_rl_fsdp_dir = actor_dir.parent
+
+            if best_rl_hf_dir.exists():
+                shutil.rmtree(best_rl_hf_dir)
+            shutil.copytree(tmp_rl_hf_dir, best_rl_hf_dir)
+
+            print(f"[Stage 4]  New best RL ckpt: {best_rl_step}  (ACC={best_acc:.6f})", flush=True)
+
+    # 清理临时 HF 目录
+    if tmp_rl_hf_dir.exists():
+        shutil.rmtree(tmp_rl_hf_dir)
+
+    # 只保留最优的 RL FSDP ckpt，删掉其它 global_step_xxx 目录
+    for actor_dir in rl_actor_ckpts:
+        fsdp_dir = actor_dir.parent
+        if best_rl_fsdp_dir is None or fsdp_dir == best_rl_fsdp_dir:
+            continue
+        print(f"[Stage 4] Removing non-best RL ckpt: {fsdp_dir}", flush=True)
+        shutil.rmtree(fsdp_dir)
+
+    print(f"[Stage 4] Best RL checkpoint on D2: {best_rl_step}, ACC={best_acc:.6f}", flush=True)
+    wandb.log({
+        "rl_best_step": best_rl_step,
+        "rl_best_acc_on_D2": best_acc,
+    })
+
     # ===== 总结 =====
     total_time = time.time() - start_time
     wandb.log({
@@ -551,7 +631,7 @@ def main():
 
     print(f"[Done] Total wallclock: {total_time / 3600.0:.4f} h")
     print(f"[Done] Best SFT checkpoint on D2 (HF merged copy): {best_sft_hf_dir}")
-    print(f"[Done] RL checkpoints root (FSDP): {rl_ckpts_root}")
+    print(f"[Done] Best RL checkpoint on D2 (HF merged copy): {best_rl_hf_dir}")
 
 
 if __name__ == "__main__":

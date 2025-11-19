@@ -4,18 +4,18 @@
 # export TRANSFORMERS_CACHE="/autodl-pub/data/hf_cache"
 # export WANDB_API_KEY="你的wandb key"
 
-python -m recipe.ASR.ASR \
-  --base_model_or_ckpt meta-llama/Llama-3.1-8B-Instruct \
+python -m recipe.ASR.sft_then_rl \
+  --base_model_or_ckpt Qwen/Qwen3-8B \
+  --sft_master_port 29500 \
   --sft_node_rank 0 \
   --sft_master_addr <address> \
   --rl_ray_address <address:port> \
-  --sft_ckpt_dir openscience_ASR_full_sft \
-  --rl_ckpt_dir openscience_ASR_full_rl \
+  --sft_ckpt_dir math_two_full_sft \
+  --rl_ckpt_dir math_two_full_rl \
   --sft_lora_enable 0 \
   --rl_lora_enable 0 \
-  --sft_task openscience \
-  --rl_task openscience \
-  --sft_master_port 29500 \
+  --sft_task MATH \
+  --rl_task OpenR1_Math_220k \
   --rl_rollout_gpu_memory_utilization 0.5 \
   --rl_micro_batch_size_per_gpu 2 \
   --ref_log_prob_micro_batch_size_per_gpu 2 \
@@ -23,19 +23,26 @@ python -m recipe.ASR.ASR \
 
 
 
-MODEL=/root/workspace/checkpoints/ASR_openscience_openscience_lora_0_0_best_ckpt_on_D2
+MODEL=/root/workspace/checkpoints/Two_MATH_OpenR1_Math_220k_lora_0_0_best_ckpt_on_D2
 DATA_DIR=/root/workspace/ASR_data/test
 OUT_DIR=/root/workspace/ASR_data/predictions
 RAY_ADDR=<address>
 
 DATASETS=(
-  gpqa_diamond
-  gpqa_main
-  gpq_extended
-  simpleqa
-  frames
-  hle
-  mmlu_pro
+  aime24
+  aime25
+  amc23
+  math500
+  omni_math
+  minerva
+  OlympiadBench_math_en_comp
+  OlympiadBench_math_zh_comp
+  OlympiadBench_math_en_cee
+  OlympiadBench_math_zh_cee
+  OlympiadBench_physics_en_comp
+  OlympiadBench_physics_zh_comp
+  OlympiadBench_physics_en_cee
+  OlympiadBench_physics_zh_cee
 )
 
 for name in "${DATASETS[@]}"; do
@@ -44,7 +51,7 @@ for name in "${DATASETS[@]}"; do
   python -m verl.trainer.main_generation \
     --model.path=$MODEL \
     --data.path=$DATA_DIR/${name}.parquet \
-    --data.output_path=$OUT_DIR/ASR_openscience_openscience_lora_0_0_best_ckpt_on_D2_${name}.parquet \
+    --data.output_path=$OUT_DIR/Two_MATH_OpenR1_Math_220k_lora_0_0_best_ckpt_on_D2_${name}.parquet \
     --trainer.nnodes=4 \
     --trainer.n_gpus_per_node=8 \
     --ray_address=$RAY_ADDR \

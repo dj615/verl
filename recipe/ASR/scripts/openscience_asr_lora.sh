@@ -6,6 +6,7 @@
 
 python -m recipe.ASR.ASR \
   --base_model_or_ckpt meta-llama/Llama-3.1-8B-Instruct \
+  --sft_node_rank 0 \
   --sft_master_addr <address> \
   --rl_ray_address <address:port> \
   --sft_ckpt_dir openscience_ASR_lora_sft \
@@ -20,7 +21,7 @@ python -m recipe.ASR.ASR \
 
 
 
-MODEL=/root/workspace/checkpoints/best_openscience_openscience_lora_1_1_ckpt_on_D2
+MODEL=/root/workspace/checkpoints/ASR_openscience_openscience_lora_1_1_best_ckpt_on_D2
 DATA_DIR=/root/workspace/ASR_data/test
 OUT_DIR=/root/workspace/ASR_data/predictions
 RAY_ADDR=<address>
@@ -41,7 +42,7 @@ for name in "${DATASETS[@]}"; do
   python -m verl.trainer.main_generation \
     --model.path=$MODEL \
     --data.path=$DATA_DIR/${name}.parquet \
-    --data.output_path=$OUT_DIR/best_openscience_openscience_lora_1_1_ckpt_on_D2_${name}.parquet \
+    --data.output_path=$OUT_DIR/ASR_openscience_openscience_lora_1_1_best_ckpt_on_D2_${name}.parquet \
     --trainer.nnodes=4 \
     --trainer.n_gpus_per_node=8 \
     --ray_address=$RAY_ADDR \

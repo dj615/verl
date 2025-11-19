@@ -744,7 +744,7 @@ def main():
             if (best_D2_acc is None) or (Pn > best_D2_acc):
                 best_D2_acc = Pn
                 best_D2_ckpt = current_ckpt
-                best_D2_hf_dir = work / f"best_{args.sft_task}_{args.rl_task}_lora_{args.sft_lora_enable}_{args.rl_lora_enable}_ckpt_on_D2"
+                best_D2_hf_dir = work / f"ASR_{args.sft_task}_{args.rl_task}_lora_{args.sft_lora_enable}_{args.rl_lora_enable}_best_ckpt_on_D2"
 
                 if best_D2_hf_dir.exists():
                     shutil.rmtree(best_D2_hf_dir)
