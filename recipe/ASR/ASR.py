@@ -347,7 +347,7 @@ def main():
     # Batch / LR / Epoch
     parser.add_argument("--sft_batch_size", type=int, default=32)
     parser.add_argument("--sft_micro_batch_size_per_gpu", type=int, default=1)
-    parser.add_argument("--sft_learning_rate", type=float, default=5e-6)
+    parser.add_argument("--sft_learning_rate", type=float, default=5e-5)
     parser.add_argument("--sft_lr_schedule", type=str, default="constant")
     # 多机多卡
     parser.add_argument("--sft_nproc_per_node", type=int, default=8)
@@ -377,7 +377,7 @@ def main():
     parser.add_argument("--rl_micro_batch_size_per_gpu", type=int, default=2)
     parser.add_argument("--ref_log_prob_micro_batch_size_per_gpu", type=int, default=2)
     parser.add_argument("--rollout_log_prob_micro_batch_size_per_gpu", type=int, default=2)
-    parser.add_argument("--rl_learning_rate", type=float, default=5e-6)
+    parser.add_argument("--rl_learning_rate", type=float, default=5e-5)
     parser.add_argument("--rl_lr_schedule", type=str, default="constant")
     # Algo & KL (GRPO 风格)
     parser.add_argument("--rl_adv_estimator", type=str, default="grpo")
