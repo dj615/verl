@@ -285,8 +285,12 @@ def build_rl_cmd(args, ckpt_in: str, ckpt_out: Path) -> str:
         f"trainer.default_local_dir={str(ckpt_out)}",
         f"trainer.n_gpus_per_node={args.rl_trainer_n_gpus_per_node}",
         f"trainer.nnodes={args.rl_trainer_nnodes}",
-        "trainer.save_freq=5",
     ]
+    # epoch-wise 保存 ckpt：trainer.save_freq 设为“每个 epoch 的 step 数”
+    rl_steps_per_epoch = getattr(args, "rl_steps_per_epoch", None)
+    if rl_steps_per_epoch is not None:
+        parts.append(f"trainer.save_freq={rl_steps_per_epoch}")
+
     return " ".join(str(p) for p in parts if p)
 
 
@@ -350,7 +354,7 @@ def main():
     parser.add_argument("--rl_lora_alpha", type=int, default=16)
 
     parser.add_argument("--rl_batch_size", type=int, default=128)
-    parser.add_argument("--ppo_mini_batch_size", type=int, default=32)
+    parser.add_argument("--ppo_mini_batch_size", type=int, default=256)
     parser.add_argument("--rl_micro_batch_size_per_gpu", type=int, default=2)
     parser.add_argument("--ref_log_prob_micro_batch_size_per_gpu", type=int, default=2)
     parser.add_argument("--rollout_log_prob_micro_batch_size_per_gpu", type=int, default=2)
@@ -397,9 +401,9 @@ def main():
         args.rl_ckpt_dir = f"Two_rl_{args.task}_{timestamp}"
     
     args.d1_train = f"/root/workspace/ASR_data/train/{args.sft_task}.jsonl"
-    args.d1_valid = f"/root/workspace/ASR_data/valid/{args.sft_task}.jsonl"
+    args.d1_val   = f"/root/workspace/ASR_data/valid/{args.sft_task}.jsonl"
     args.d2_train = f"/root/workspace/ASR_data/train/{args.rl_task}.jsonl"
-    args.d2_valid = f"/root/workspace/ASR_data/valid/{args.rl_task}.jsonl"
+    args.d2_val   = f"/root/workspace/ASR_data/valid/{args.rl_task}.jsonl"
 
     # ===== 准备工作目录 =====
     work = Path(args.work_dir)
@@ -419,19 +423,32 @@ def main():
     sft_steps_per_epoch = calc_steps(d1_train_size, sft_global_batch, epochs=1)
     args.sft_steps_per_epoch = sft_steps_per_epoch  # 挂到 args 上，供 build_sft_cmd 使用
 
+    d2_train_size = count_samples_in_paths(args.d2_train)
+    rl_global_batch = args.rl_batch_size
+    rl_steps_per_epoch = calc_steps(d2_train_size, rl_global_batch, epochs=1)
+    args.rl_steps_per_epoch = rl_steps_per_epoch  # 挂到 args 上，供 build_rl_cmd 使用
+
+
     def _fmt(v):
         return v if v is not None else "Unknown"
 
     print("=" * 60)
     print("[SFT-then-RL Controller] Training configuration summary")
     print(f"  D1 train examples: {_fmt(d1_train_size)}")
+    print(f"  D2 train examples: {_fmt(d2_train_size)}")
     print(f"  D2 val   examples: {_fmt(d2_val_size)}")
     print()
     print("  SFT:")
     print(f"    epochs: {args.sft_epochs}")
     print(f"    global batch size: {sft_global_batch}")
     print(f"    estimated steps per epoch: {_fmt(sft_steps_per_epoch)}")
+    print()
+    print("  RL:")
+    print(f"    epochs: {args.rl_epochs}")
+    print(f"    global batch size: {rl_global_batch}")
+    print(f"    estimated steps per epoch: {_fmt(rl_steps_per_epoch)}")
     print("=" * 60, flush=True)
+
 
     # ===== wandb init =====
     if args.wandb_project and args.wandb_mode != "disabled":

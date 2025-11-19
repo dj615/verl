@@ -373,7 +373,7 @@ def main():
     parser.add_argument("--rl_lora_alpha", type=int, default=16)
     # Batch / LR / Epoch
     parser.add_argument("--rl_batch_size", type=int, default=128)
-    parser.add_argument("--ppo_mini_batch_size", type=int, default=32)
+    parser.add_argument("--ppo_mini_batch_size", type=int, default=256)
     parser.add_argument("--rl_micro_batch_size_per_gpu", type=int, default=2)
     parser.add_argument("--ref_log_prob_micro_batch_size_per_gpu", type=int, default=2)
     parser.add_argument("--rollout_log_prob_micro_batch_size_per_gpu", type=int, default=2)
