@@ -6,7 +6,7 @@ import pyarrow.parquet as pq
 from datasets import load_dataset
 
 SAVE_DIR = "/root/workspace/ASR_data/test"
-DATA_NAME = "HLE"
+DATA_NAME = "hle"
 OUTPUT_JSONL = os.path.join(SAVE_DIR, f"{DATA_NAME}.jsonl")
 OUTPUT_PARQUET = os.path.join(SAVE_DIR, f"{DATA_NAME}.parquet")
 

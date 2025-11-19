@@ -338,7 +338,7 @@ def main():
 
     # ===== SFT 配置（映射到 sft_trainer.yaml）=====
     # Data Process
-    parser.add_argument("--sft_max_length", type=int, default=40960)
+    parser.add_argument("--sft_max_length", type=int, default=30000)
     parser.add_argument("--sft_truncation", type=str, default="right", choices=["error", "left", "right", "middle"], help="SFT 超过最大长度的样本处理方式（默认右截断）")
     # LoRA
     parser.add_argument("--sft_lora_enable", type=int, default=1)
@@ -361,7 +361,7 @@ def main():
     # Data Process
     parser.add_argument("--rl_train_max_samples", type=int, default=-1, help="RL 阶段最大训练样本数，-1 表示使用全部数据")
     parser.add_argument("--rl_val_max_samples", type=int, default=-1, help="RL 阶段最大验证样本数，-1 表示使用全部数据")
-    parser.add_argument("--rl_max_prompt_length", type=int, default=40960)
+    parser.add_argument("--rl_max_prompt_length", type=int, default=30000)
     parser.add_argument("--rl_max_response_length", type=int, default=8192)
     parser.add_argument("--rl_filter_overlong_prompts", action="store_true", default=True, help="RL 是否过滤过长 prompt 样本（默认开启）")
     parser.add_argument("--rl_filter_overlong_prompts_workers", type=int, default=2, help="RL 过滤过长样本时的并行 worker 数量")
@@ -401,7 +401,7 @@ def main():
     # ===== 指标计算 =====
     parser.add_argument("--max_eval_samples", type=int, default=2048)
     parser.add_argument("--eval_batch_size", type=int, default=4)
-    parser.add_argument("--max_length", type=int, default=40960, help="只计算 len(prompt + response) < max_length 的数据")
+    parser.add_argument("--max_length", type=int, default=30000, help="只计算 len(prompt + response) < max_length 的数据")
     parser.add_argument("--truncate_mode", type=str, default="skip", choices=["truncate", "skip"])
 
     # ===== wandb =====

@@ -317,16 +317,16 @@ def main():
     parser.add_argument("--response_key_d2", type=str, default="answer")
 
     # ===== SFT 配置 =====
-    parser.add_argument("--sft_max_length", type=int, default=40960)
+    parser.add_argument("--sft_max_length", type=int, default=30000)
     parser.add_argument("--sft_truncation", type=str, default="right", choices=["error", "left", "right", "middle"])
     parser.add_argument("--sft_lora_enable", type=int, default=1)
     parser.add_argument("--sft_lora_rank", type=int, default=8)
     parser.add_argument("--sft_lora_alpha", type=int, default=16)
     parser.add_argument("--sft_batch_size", type=int, default=32)
     parser.add_argument("--sft_micro_batch_size_per_gpu", type=int, default=1)
-    parser.add_argument("--sft_learning_rate", type=float, default=5e-6)
+    parser.add_argument("--sft_learning_rate", type=float, default=5e-5)
     parser.add_argument("--sft_lr_schedule", type=str, default="constant")
-    parser.add_argument("--sft_epochs", type=int, default=10)
+    parser.add_argument("--sft_epochs", type=int, default=5)
     parser.add_argument("--sft_experiment_name", type=str, default="sft_then_rl_sft")
 
     # 多机多卡
@@ -354,10 +354,10 @@ def main():
     parser.add_argument("--rl_micro_batch_size_per_gpu", type=int, default=2)
     parser.add_argument("--ref_log_prob_micro_batch_size_per_gpu", type=int, default=2)
     parser.add_argument("--rollout_log_prob_micro_batch_size_per_gpu", type=int, default=2)
-    parser.add_argument("--rl_learning_rate", type=float, default=5e-6)
+    parser.add_argument("--rl_learning_rate", type=float, default=5e-5)
     parser.add_argument("--rl_lr_schedule", type=str, default="constant")
-    parser.add_argument("--rl_epochs", type=int, default=10)
-    parser.add_argument("--rl_max_prompt_length", type=int, default=40960)
+    parser.add_argument("--rl_epochs", type=int, default=5)
+    parser.add_argument("--rl_max_prompt_length", type=int, default=30000)
     parser.add_argument("--rl_max_response_length", type=int, default=8192)
 
     parser.add_argument("--rl_adv_estimator", type=str, default="grpo")
@@ -380,7 +380,7 @@ def main():
     # ===== 指标计算 =====
     parser.add_argument("--max_eval_samples", type=int, default=2048)
     parser.add_argument("--eval_batch_size", type=int, default=4)
-    parser.add_argument("--max_length", type=int, default=40960)
+    parser.add_argument("--max_length", type=int, default=30000)
     parser.add_argument("--truncate_mode", type=str, default="truncate", choices=["truncate", "skip"])
 
     # ===== wandb =====
