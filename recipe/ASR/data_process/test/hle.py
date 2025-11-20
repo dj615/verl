@@ -22,13 +22,15 @@ def main():
         # 只保留 image 为 None 的样本
         if ex.get("image") is not None:
             continue
-
+        
+        id = ex.get("id", "")
         question = ex.get("question", "")
         answer = ex.get("answer", "")
         answer_type = ex.get("answer_type", "")
 
         records.append(
             {
+                "id": id,
                 "prompt": question,
                 "groundtruth": answer,
                 "answer_type": answer_type,

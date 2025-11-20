@@ -82,11 +82,9 @@ def _prepare_ds(
 
     def _tok(ex):
         # 手动分步 tokenize 以便判断长度
-        prompt_ids = tokenizer(ex["text"].split("\n")[0], truncation=False)["input_ids"]
-        resp_ids = tokenizer(
-            ex["text"].split("\n")[1] if "\n" in ex["text"] else "",
-            truncation=False,
-        )["input_ids"]
+        prompt_text, resp_text = ex["text"].split("\n", 1)
+        prompt_ids = tokenizer(prompt_text, truncation=False)["input_ids"]
+        resp_ids = tokenizer(resp_text, truncation=False)["input_ids"]
         full_ids = prompt_ids + resp_ids
 
         if len(full_ids) > max_length:
@@ -490,6 +488,10 @@ def compute_ce_loss_on_parquet_or_jsonl(
     max_length: int = 4096,
     truncate_mode: str = "truncate",
 ) -> float:
+    world_size, rank, local_rank = _get_dist_info()
+    if world_size > 1:
+        device = f"cuda:{local_rank}"
+
     model_path, tok_path = _resolve_model_and_tokenizer_paths(model_or_ckpt, tokenizer_id)
 
     tok = AutoTokenizer.from_pretrained(
@@ -780,43 +782,79 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=8192)
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--output", type=str, required=True)
+    parser.add_argument("--mode", type=str, default="hp", choices=["hp", "ce", "acc"])
     args = parser.parse_args()
 
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
 
-    # 这里假设你的 compute_* 已经内部做了 all_reduce
-    H = compute_policy_entropy_on_parquet_or_jsonl(
-        model_or_ckpt=args.model_or_ckpt,
-        tokenizer_id=args.tokenizer_id,
-        file_path=args.file_path,
-        prompt_key=args.prompt_key,
-        response_key=args.response_key,
-        device=f"cuda:{local_rank}",
-        dtype=args.dtype,
-        max_samples=args.max_samples,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-        truncate_mode=args.truncate_mode,
-    )
+    result = {}
+    if args.mode in ["hp"]:
+        # 这里假设你的 compute_* 已经内部做了 all_reduce
+        H = compute_policy_entropy_on_parquet_or_jsonl(
+            model_or_ckpt=args.model_or_ckpt,
+            tokenizer_id=args.tokenizer_id,
+            file_path=args.file_path,
+            prompt_key=args.prompt_key,
+            response_key=args.response_key,
+            device=f"cuda:{local_rank}",
+            dtype=args.dtype,
+            max_samples=args.max_samples,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            truncate_mode=args.truncate_mode,
+        )
+        P = compute_accuracy_on_parquet_or_jsonl(
+            model_or_ckpt=args.model_or_ckpt,
+            tokenizer_id=args.tokenizer_id,
+            file_path=args.file_path,
+            prompt_key=args.prompt_key,
+            device=f"cuda:{local_rank}",
+            dtype=args.dtype,
+            max_samples=args.max_samples,
+            batch_size=args.batch_size,
+            max_prompt_length=args.max_prompt_length,
+            max_new_tokens=args.max_new_tokens,
+            data_source_key="data_source",
+        )
+        result.update({"H": H, "P": P})
 
-    P = compute_accuracy_on_parquet_or_jsonl(
-        model_or_ckpt=args.model_or_ckpt,
-        tokenizer_id=args.tokenizer_id,
-        file_path=args.file_path,
-        prompt_key=args.prompt_key,
-        device=f"cuda:{local_rank}",
-        dtype=args.dtype,
-        max_samples=args.max_samples,
-        batch_size=args.batch_size,
-        max_prompt_length=args.max_prompt_length,
-        max_new_tokens=args.max_new_tokens,
-        data_source_key="data_source",
-    )
+    if args.mode in ["ce"]:
+        CE = compute_ce_loss_on_parquet_or_jsonl(
+            model_or_ckpt=args.model_or_ckpt,
+            tokenizer_id=args.tokenizer_id,
+            file_path=args.file_path,
+            prompt_key=args.prompt_key,
+            response_key=args.response_key,
+            device=f"cuda:{local_rank}",
+            dtype=args.dtype,
+            max_samples=args.max_samples,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            truncate_mode=args.truncate_mode,
+        )
+        result.update({"CE": CE})
 
+    if args.mode == "acc":
+        ACC = compute_accuracy_on_parquet_or_jsonl(
+            model_or_ckpt=args.model_or_ckpt,
+            tokenizer_id=args.tokenizer_id,
+            file_path=args.file_path,
+            prompt_key=args.prompt_key,
+            device=f"cuda:{local_rank}",
+            dtype=args.dtype,
+            max_samples=args.max_samples,
+            batch_size=args.batch_size,
+            max_prompt_length=args.max_prompt_length,
+            max_new_tokens=args.max_new_tokens,
+            data_source_key="data_source",
+        )
+        result.update({"ACC": ACC})
+
+    dist.barrier()
     if dist.get_rank() == 0:
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump({"H": H, "P": P}, f)
+        with open(args.output, "w") as f:
+            json.dump(result, f)
 
     dist.destroy_process_group()

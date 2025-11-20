@@ -10,7 +10,49 @@ from typing import Optional, Dict
 import wandb
 import shutil
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import socket
+
 # ========== 基础工具函数 ==========
+
+def run_multinode_torchrun(
+    cmd_template: str,
+    hosts: list,
+    nnodes: int,
+    env: Optional[Dict[str, str]] = None,
+):
+    """
+    在每个 host 上同时执行一条 torchrun（node_rank 不同）。
+    cmd_template 里必须包含字符串 "{NODE_RANK}" 作为占位符。
+    """
+    assert "{NODE_RANK}" in cmd_template, "cmd_template must contain {NODE_RANK}"
+
+    local_hostnames = {
+        "localhost",
+        "127.0.0.1",
+        socket.gethostname(),
+        socket.getfqdn(),
+    }
+
+    def _launch_one(rank, host):
+        cmd = cmd_template.format(NODE_RANK=rank)
+        if host in local_hostnames:
+            print(f"[LOCAL NODE {rank}] {cmd}", flush=True)
+            return subprocess.run(shlex.split(cmd), env=env).returncode
+        else:
+            remote_cmd = f"cd {os.getcwd()} && {cmd}"
+            ssh_cmd = ["ssh", host, "bash", "-lc", remote_cmd]
+            print(f"[SSH NODE {rank}@{host}] {remote_cmd}", flush=True)
+            return subprocess.run(ssh_cmd, env=env).returncode
+
+    rets = []
+    with ThreadPoolExecutor(max_workers=nnodes) as ex:
+        futs = [ex.submit(_launch_one, r, hosts[r]) for r in range(nnodes)]
+        for f in as_completed(futs):
+            rets.append(f.result())
+
+    if any(r != 0 for r in rets):
+        raise RuntimeError(f"multinode torchrun failed, return codes={rets}")
 
 def merge_fsdp_to_hf(fsdp_ckpt_dir: Path, target_dir: Path):
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -158,7 +200,7 @@ def build_sft_cmd(args, ckpt_in: str, ckpt_out: Path, phase: int) -> str:
     else:
         parts += [
             f"--nnodes={args.sft_nnodes}",
-            f"--node_rank={args.sft_node_rank}",
+            "--node_rank={NODE_RANK}",
             f"--nproc_per_node={args.sft_nproc_per_node}",
             f"--master_addr={args.sft_master_addr}",
             f"--master_port={args.sft_master_port}",
@@ -209,7 +251,7 @@ def run_distributed_eval(model_or_ckpt: str, tokenizer_id: str, args, work: Path
         "torchrun",
         f"--nnodes={args.rl_trainer_nnodes}",
         f"--nproc_per_node={args.rl_trainer_n_gpus_per_node}",
-        f"--node_rank={args.sft_node_rank}",
+        "--node_rank={NODE_RANK}",
         f"--master_addr={args.sft_master_addr}",
         f"--master_port={args.sft_master_port}",
         "-m", "recipe.ASR.metrics",
@@ -227,8 +269,12 @@ def run_distributed_eval(model_or_ckpt: str, tokenizer_id: str, args, work: Path
         f"--dtype={args.dtype}",
         f"--output={out_file}",
     ]
-    cmd = " ".join(str(p) for p in parts if p)
-    run_cmd(cmd)
+    cmd_template = " ".join(str(p) for p in parts if p)
+    run_multinode_torchrun(
+        cmd_template=cmd_template,
+        hosts=_split_paths(args.sft_hosts),
+        nnodes=args.rl_trainer_nnodes,
+    )
 
     with open(out_file, "r", encoding="utf-8") as f:
         j = json.load(f)
@@ -309,7 +355,7 @@ def main():
     # ===== 基础参数 =====
     parser.add_argument("--base_model_or_ckpt", type=str, required=True)
     parser.add_argument("--tokenizer", type=str, default=None)
-    parser.add_argument("--work_dir", type=str, default="/root/workspace/checkpoints")
+    parser.add_argument("--work_dir", type=str, default="/root/storage/zhoumengyu.zmy/checkpoints", help="需要是共享盘，方便多机之间访问共同的 ckpt")
     parser.add_argument("--sft_ckpt_dir", type=str, default=None)
     parser.add_argument("--rl_ckpt_dir", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16")
@@ -323,6 +369,7 @@ def main():
     parser.add_argument("--max_phases", type=int, default=10)
     parser.add_argument("--sft_epochs", type=int, default=1)
     parser.add_argument("--rl_epochs", type=int, default=1)
+    parser.add_argument("--sft_hosts", type=str, default=None, help="多机 host 列表，逗号分隔，长度必须等于 sft_nnodes，例如: host0,host1,host2,host3")
 
     # ===== 数据集 =====
     parser.add_argument("--sft_task", type=str, choices=["DAPO_MATH", "gsm8k", "HARP", "MATH", "NuminaMath_1.5", "NuminaMath_CoT", "OpenR1_Math_220k", "openscience"], required=True)
@@ -352,7 +399,6 @@ def main():
     # 多机多卡
     parser.add_argument("--sft_nproc_per_node", type=int, default=8)
     parser.add_argument("--sft_nnodes", type=int, default=4, help="一共几台机器")
-    parser.add_argument("--sft_node_rank", type=int, default=0, help="当前机器的序号（从 0 开始）")
     parser.add_argument("--sft_master_addr", type=str, default=None, help="告诉所有节点主节点的 IP 地址")
     parser.add_argument("--sft_master_port", type=str, default="29500", help="各节点通过此端口通信，未被占用即可")
 
@@ -415,6 +461,15 @@ def main():
     args = parser.parse_args()
 
     # ---- 一些 sanity check ----
+    if args.sft_nnodes > 1:
+        if not args.sft_hosts:
+            raise ValueError("sft_nnodes>1 but --sft_hosts not provided")
+        hosts = _split_paths(args.sft_hosts)
+        if len(hosts) != args.sft_nnodes:
+            raise ValueError(f"--sft_hosts length {len(hosts)} != sft_nnodes {args.sft_nnodes}")
+    else:
+        hosts = ["localhost"]
+
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.sft_ckpt_dir is None:
@@ -650,7 +705,14 @@ def main():
             ckpt_out.mkdir(parents=True, exist_ok=True)
             cmd = build_rl_cmd(args, current_ckpt, ckpt_out, phase=n)
 
-        run_cmd(cmd)
+        if stage == "SFT":
+            run_multinode_torchrun(
+                cmd_template=cmd,
+                hosts=hosts,
+                nnodes=args.sft_nnodes,
+            )
+        else:
+            run_cmd(cmd)
 
         # step-wise 情况下，累计已训练步数
         if args.validation_strategy == "steps":

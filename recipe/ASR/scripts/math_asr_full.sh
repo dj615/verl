@@ -6,7 +6,6 @@
 
 python -m recipe.ASR.ASR \
   --base_model_or_ckpt Qwen/Qwen3-8B \
-  --sft_node_rank 0 \
   --sft_master_addr <address> \
   --rl_ray_address <address:port> \
   --sft_ckpt_dir math_ASR_full_sft \
@@ -23,7 +22,7 @@ python -m recipe.ASR.ASR \
 
 
 
-MODEL=/root/workspace/checkpoints/ASR_MATH_OpenR1_Math_220k_lora_0_0_best_ckpt_on_D2
+MODEL=/root/storage/zhoumengyu.zmy/checkpoints/ASR_MATH_OpenR1_Math_220k_lora_0_0_best_ckpt_on_D2
 DATA_DIR=/root/workspace/ASR_data/test
 OUT_DIR=/root/workspace/ASR_data/predictions
 RAY_ADDR=<address>

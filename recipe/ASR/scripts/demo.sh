@@ -39,3 +39,4 @@ python -m recipe.ASR.ASR \
   --eval_batch_size 2 \
   --wandb_project ASR \
   --wandb_run_name MATH_Train
+  

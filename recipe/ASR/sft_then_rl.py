@@ -9,6 +9,8 @@ from typing import Optional, Dict, List
 
 import wandb
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import socket
 
 from .metrics import (
     compute_ce_loss_on_parquet_or_jsonl,
@@ -16,6 +18,82 @@ from .metrics import (
 )
 
 # ========== 基础工具函数 ==========
+
+def run_multinode_torchrun(cmd_template: str, hosts: list, nnodes: int, env=None):
+    assert "{NODE_RANK}" in cmd_template
+    local_hostnames = {
+        "localhost", "127.0.0.1", socket.gethostname(), socket.getfqdn()
+    }
+
+    def _launch(rank, host):
+        cmd = cmd_template.format(NODE_RANK=rank)
+        if host in local_hostnames:
+            return subprocess.run(shlex.split(cmd), env=env).returncode
+        remote_cmd = f"cd {os.getcwd()} && {cmd}"
+        ssh_cmd = ["ssh", host, "bash", "-lc", remote_cmd]  # 关键：加载环境
+        return subprocess.run(ssh_cmd, env=env).returncode
+
+    rets = []
+    with ThreadPoolExecutor(max_workers=nnodes) as ex:
+        futs = [ex.submit(_launch, r, hosts[r]) for r in range(nnodes)]
+        for f in as_completed(futs):
+            rets.append(f.result())
+
+    if any(r != 0 for r in rets):
+        raise RuntimeError(f"multinode torchrun failed: {rets}")
+
+def run_distributed_ce(model_or_ckpt: str, tokenizer_id: str, args, work: Path, tag: str, hosts):
+    out_file = work / f"ce_{tag}.json"
+    parts = [
+        "torchrun",
+        f"--nnodes={args.sft_nnodes}",
+        f"--nproc_per_node={args.sft_nproc_per_node}",
+        "--node_rank={NODE_RANK}",
+        f"--master_addr={args.sft_master_addr}",
+        f"--master_port={args.sft_master_port}",
+        "-m", "recipe.ASR.metrics",
+        "--mode=ce",
+        f"--model_or_ckpt={model_or_ckpt}",
+        f"--tokenizer_id={tokenizer_id}",
+        f"--file_path={args.d2_val}",
+        f"--prompt_key={args.prompt_key_d2}",
+        f"--response_key={args.response_key_d2}",
+        f"--max_samples={args.max_eval_samples}",
+        f"--batch_size={args.eval_batch_size}",
+        f"--max_length={args.max_length}",
+        f"--truncate_mode={args.truncate_mode}",
+        f"--dtype={args.dtype}",
+        f"--output={out_file}",
+    ]
+    cmd = " ".join(parts)
+    run_multinode_torchrun(cmd, hosts, args.sft_nnodes)
+    return json.load(open(out_file))["CE"]
+
+def run_distributed_acc(model_or_ckpt: str, tokenizer_id: str, args, work: Path, tag: str, hosts):
+    out_file = work / f"acc_{tag}.json"
+    parts = [
+        "torchrun",
+        f"--nnodes={args.sft_nnodes}",
+        f"--nproc_per_node={args.sft_nproc_per_node}",
+        "--node_rank={NODE_RANK}",
+        f"--master_addr={args.sft_master_addr}",
+        f"--master_port={args.sft_master_port}",
+        "-m", "recipe.ASR.metrics",
+        "--mode=acc",
+        f"--model_or_ckpt={model_or_ckpt}",
+        f"--tokenizer_id={tokenizer_id}",
+        f"--file_path={args.d2_val}",
+        f"--prompt_key={args.prompt_key_d2}",
+        f"--max_samples={args.max_eval_samples}",
+        f"--batch_size={args.eval_batch_size}",
+        f"--max_prompt_length={args.rl_max_prompt_length}",
+        f"--max_new_tokens={args.rl_max_response_length}",
+        f"--dtype={args.dtype}",
+        f"--output={out_file}",
+    ]
+    cmd = " ".join(parts)
+    run_multinode_torchrun(cmd, hosts, args.sft_nnodes)
+    return json.load(open(out_file))["ACC"]
 
 def run_cmd(cmd: str, env: Optional[Dict[str, str]] = None):
     print("[CMD]", cmd, flush=True)
@@ -193,7 +271,7 @@ def build_sft_cmd(args, ckpt_in: str, ckpt_out: Path) -> str:
     else:
         parts += [
             f"--nnodes={args.sft_nnodes}",
-            f"--node_rank={args.sft_node_rank}",
+            "--node_rank={NODE_RANK}",
             f"--nproc_per_node={args.sft_nproc_per_node}",
             f"--master_addr={args.sft_master_addr}",
             f"--master_port={args.sft_master_port}",
@@ -309,6 +387,7 @@ def main():
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--best_rl_hf_subdir", type=str, default=None, help="相对于 work_dir 的子目录名，用于保存最佳 RL HF 合并后的 HF 模型")
+    parser.add_argument("--sft_hosts", type=str, default=None, help="逗号分隔 host 列表，长度= sft_nnodes")
 
     # ===== 数据集 =====
     parser.add_argument("--sft_task", type=str, choices=["DAPO_MATH", "gsm8k", "HARP", "MATH", "NuminaMath_1.5", "NuminaMath_CoT", "OpenR1_Math_220k", "openscience"], required=True)
@@ -337,12 +416,13 @@ def main():
 
     # 多机多卡
     parser.add_argument("--sft_nproc_per_node", type=int, default=8)
-    parser.add_argument("--sft_nnodes", type=int, default=4)
+    parser.add_argument("--sft_nnodes", type=int, default=1)
     parser.add_argument("--sft_node_rank", type=int, default=0)
     parser.add_argument("--sft_master_addr", type=str, default=None)
     parser.add_argument("--sft_master_port", type=str, default="29500")
 
     # ===== RL 配置（main_ppo）=====
+    parser.add_argument("--rl_ray_address", type=str, default=None, help="Ray dashboard or gcs address, e.g. http://head:8265")
     parser.add_argument("--rl_rollout_gpu_memory_utilization", type=float, default=0.5)
     parser.add_argument("--rl_train_max_samples", type=int, default=-1)
     parser.add_argument("--rl_val_max_samples", type=int, default=-1)
@@ -396,14 +476,21 @@ def main():
 
     args = parser.parse_args()
 
-    if args.best_rl_hr_subdir is None:
-        args.best_rl_hr_subdir = f"Two_{args.sft_task}_{args.rl_dir}_lora_{args.sft_lora_enable}_{args.rl_lora_enable}_best_ckpt_on_D2"
+    if args.sft_nnodes > 1:
+        hosts = _split_paths(args.sft_hosts)
+        if len(hosts) != args.sft_nnodes:
+            raise ValueError("sft_hosts length must == sft_nnodes")
+    else:
+        hosts = ["localhost"]
+
+    if args.best_rl_hf_subdir is None:
+        args.best_rl_hf_subdir = f"Two_{args.sft_task}_{args.rl_task}_lora_{args.sft_lora_enable}_{args.rl_lora_enable}_best_ckpt_on_D2"
 
     if args.sft_ckpt_dir is None or args.rl_ckpt_dir is None:
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.sft_ckpt_dir = f"Two_sft_{args.task}_{timestamp}"
-        args.rl_ckpt_dir = f"Two_rl_{args.task}_{timestamp}"
+        args.sft_ckpt_dir = f"Two_sft_{args.sft_task}_{timestamp}"
+        args.rl_ckpt_dir = f"Two_rl_{args.rl_task}_{timestamp}"
     
     args.d1_train = f"/root/workspace/ASR_data/train/{args.sft_task}.jsonl"
     args.d1_val   = f"/root/workspace/ASR_data/valid/{args.sft_task}.jsonl"
@@ -476,8 +563,11 @@ def main():
 
     # ===== 阶段 1：SFT 训练，保存 epoch-wise ckpt =====
     print("[Stage 1] SFT training starts...", flush=True)
-    sft_cmd = build_sft_cmd(args, base_model, sft_ckpts_root)
-    run_cmd(sft_cmd)
+    sft_cmd = build_sft_cmd(...)
+    if args.sft_nnodes > 1:
+        run_multinode_torchrun(sft_cmd, hosts, args.sft_nnodes)
+    else:
+        run_cmd(sft_cmd)
     print("[Stage 1] SFT training finished.", flush=True)
 
     # ===== 阶段 2：遍历所有 SFT ckpt，在 D2 val 上计算 CE，一次性选出 generalization loss 最低的 =====
@@ -503,20 +593,14 @@ def main():
         merge_fsdp_to_hf(actor_dir, tmp_hf_dir)
 
         tok_id = get_tokenizer_id_for_ckpt(str(tmp_hf_dir), args.tokenizer)
-        ce = compute_ce_loss_on_parquet_or_jsonl(
+        ce = run_distributed_ce(
             model_or_ckpt=str(tmp_hf_dir),
             tokenizer_id=tok_id,
-            file_path=args.d2_val,
-            prompt_key=args.prompt_key_d2,
-            response_key=args.response_key_d2,
-            device=args.device,
-            dtype=args.dtype,
-            max_samples=args.max_eval_samples,
-            batch_size=args.eval_batch_size,
-            max_length=args.max_length,
-            truncate_mode=args.truncate_mode,
+            args=args,
+            work=work,
+            tag=step_name,
+            hosts=hosts,
         )
-
         print(f"[Stage 2]  {step_name}  CE (D2 val) = {ce:.6f}", flush=True)
         wandb.log({
             "sft_ckpt_step_name": step_name,
@@ -543,7 +627,10 @@ def main():
     # ===== 阶段 3：基于最佳 SFT ckpt 进行 RL 训练 =====
     print("[Stage 3] RL training starts from best SFT checkpoint...", flush=True)
     rl_cmd = build_rl_cmd(args, rl_init_ckpt, rl_ckpts_root)
-    run_cmd(rl_cmd)
+    env = os.environ.copy()
+    if args.rl_ray_address:
+        env["RAY_ADDRESS"] = args.rl_ray_address
+    run_cmd(rl_cmd, env=env)
     print("[Stage 3] RL training finished.", flush=True)
 
     # ===== 阶段 4：遍历所有 RL ckpt，在 D2 val 上计算 accuracy，选出最优并只保留它 =====
@@ -571,18 +658,13 @@ def main():
         merge_fsdp_to_hf(actor_dir, tmp_rl_hf_dir)
 
         tok_id = get_tokenizer_id_for_ckpt(str(tmp_rl_hf_dir), args.tokenizer)
-        acc = compute_accuracy_on_parquet_or_jsonl(
+        acc = run_distributed_acc(
             model_or_ckpt=str(tmp_rl_hf_dir),
             tokenizer_id=tok_id,
-            file_path=args.d2_val,
-            prompt_key=args.prompt_key_d2,
-            response_key=args.response_key_d2,
-            device=args.device,
-            dtype=args.dtype,
-            max_samples=args.max_eval_samples,
-            batch_size=args.eval_batch_size,
-            max_length=args.max_length,
-            truncate_mode=args.truncate_mode,
+            args=args,
+            work=work,
+            tag=step_name,
+            hosts=hosts,
         )
 
         print(f"[Stage 4]  {step_name}  ACC (D2 val) = {acc:.6f}", flush=True)
